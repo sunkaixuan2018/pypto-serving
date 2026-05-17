@@ -167,7 +167,7 @@ class Qwen314BModelRunner(ModelRunner):
         t_prefill_start = time.perf_counter()
 
         for layer_idx, layer in enumerate(compiled.layers):
-            k_cache, v_cache = self._kv_cache_manager.materialize_decode_cache(
+            k_cache, v_cache = self._kv_cache_manager.materialize_single_layer_cache(
                 model.config.model_id,
                 layer_idx,
             )
@@ -229,7 +229,7 @@ class Qwen314BModelRunner(ModelRunner):
         hidden = decode_inputs.hidden
         dw = compiled.decode_weights
 
-        k_cache, v_cache = self._kv_cache_manager.materialize_decode_cache_all_layers(
+        k_cache, v_cache = self._kv_cache_manager.materialize_full_layer_cache(
             model.config.model_id,
         )
         refresh_kv_cache = model.config.model_id in self._l2_dirty_kv_models
@@ -549,7 +549,7 @@ class Qwen314BModelRunner(ModelRunner):
         vocab_size = model.config.vocab_size
         padded_vocab = compiled.padded_vocab
 
-        k_cache_all, v_cache_all = self._kv_cache_manager.materialize_decode_cache_all_layers(
+        k_cache_all, v_cache_all = self._kv_cache_manager.materialize_full_layer_cache(
             model.config.model_id,
         )
         _mark("kv_cache_materialize")

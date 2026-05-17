@@ -80,7 +80,7 @@ def test_kv_cache_capacity_uses_actual_runtime_batch_size():
     manager = KvCacheManager()
     manager.register_model(model.config.model_id, model.config, model.runtime)
 
-    k_cache, _ = manager.materialize_decode_cache(model.config.model_id, 0)
+    k_cache, _ = manager.materialize_single_layer_cache(model.config.model_id, 0)
     assert k_cache.shape[0] == 1 * 2 * model.config.num_key_value_heads * model.runtime.page_size
 
 

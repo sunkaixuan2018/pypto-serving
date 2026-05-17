@@ -202,19 +202,25 @@ class KvCacheManager:
             values[token_index] = pool.value_pages[layer_idx, physical_page, :, offset, :]
         return keys, values
 
-    def materialize_decode_cache(self, model_id: str, layer_idx: int) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return a flat decode-cache view for one model layer."""
+    def materialize_single_layer_cache(self, model_id: str, layer_idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return flattened K/V cache views for exactly one model layer.
+
+        The returned tensors are zero-copy views over the selected layer of
+        the paged cache, shaped ``[num_pages * num_kv_heads * page_size,
+        head_dim]``. Use this API for kernels that receive one layer's cache
+        at a time.
+        """
         pool = self._pool(model_id)
         return (
             pool.key_pages[layer_idx].reshape(-1, pool.head_dim),
             pool.value_pages[layer_idx].reshape(-1, pool.head_dim),
         )
 
-    def materialize_decode_cache_all_layers(self, model_id: str) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return KV cache as a single flat-stacked tensor across all layers.
+    def materialize_full_layer_cache(self, model_id: str) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return flattened K/V cache views stacked across every model layer.
 
-        Used by L3 stacked decode where the kernel selects layer i via an
-        arithmetic offset (layer_idx * cache_rows_per_layer) on a single
+        Use this API for fused or L3 decode kernels that select layer i via
+        an arithmetic offset (layer_idx * cache_rows_per_layer) on a single
         cache tensor. The pool is already laid out as
         ``[num_layers, num_pages, num_kv_heads, page_size, head_dim]`` so the
         flat view is zero-copy.
