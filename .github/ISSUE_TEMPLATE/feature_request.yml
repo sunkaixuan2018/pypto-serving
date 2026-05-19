@@ -1,0 +1,73 @@
+name: Feature Request
+description: Suggest a new serving feature, model integration, runtime behavior, or API enhancement
+title: "[Feature] "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for suggesting a feature. Please describe the serving workflow you want to support.
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: Brief description of the feature you would like to see
+      placeholder: "e.g., Add streaming generation support for the interactive server"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      description: Which area does this request target?
+      options:
+        - Serving API
+        - Model integration
+        - Executor or runtime
+        - Batching and scheduling
+        - Configuration
+        - Profiling or observability
+        - Documentation
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: motivation
+    attributes:
+      label: Motivation / Use Case
+      description: Why is this feature needed? What workflow does it enable?
+      placeholder: Describe the serving scenario and why existing behavior is insufficient
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposed_behavior
+    attributes:
+      label: Proposed API / Behavior
+      description: How should this feature work?
+      placeholder: |
+        ```bash
+        ./examples/pypto-serving --config ... --new-option ...
+        ```
+    validations:
+      required: false
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives Considered
+      description: What alternative solutions or workarounds have you considered?
+      placeholder: Describe any alternatives you have tried
+    validations:
+      required: false
+
+  - type: textarea
+    id: additional_context
+    attributes:
+      label: Additional Context
+      description: Any other context, references, or examples from other serving frameworks
+    validations:
+      required: false

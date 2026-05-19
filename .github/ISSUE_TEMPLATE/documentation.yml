@@ -1,0 +1,49 @@
+name: Documentation Issue
+description: Report missing, incorrect, or unclear documentation
+title: "[Docs] "
+labels: ["documentation"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for helping improve PyPTO Serving documentation.
+
+  - type: textarea
+    id: location
+    attributes:
+      label: Documentation Location
+      description: Which document, example, config, or section needs improvement?
+      placeholder: "e.g., README.md, examples/model/qwen3_14b/README.md, or an example config"
+    validations:
+      required: true
+
+  - type: textarea
+    id: issue
+    attributes:
+      label: What's Wrong or Missing?
+      description: Describe the issue with the current documentation
+      placeholder: |
+        e.g.,
+        - Incorrect command that no longer works
+        - Missing explanation for a config field
+        - Unclear device or platform setup
+        - Outdated model example
+    validations:
+      required: true
+
+  - type: textarea
+    id: suggestion
+    attributes:
+      label: Suggested Improvement
+      description: How should the documentation be improved?
+      placeholder: Describe what should be added, changed, or clarified
+    validations:
+      required: false
+
+  - type: textarea
+    id: additional_context
+    attributes:
+      label: Additional Context
+      description: Any other information that might help
+    validations:
+      required: false

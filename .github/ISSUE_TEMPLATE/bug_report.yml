@@ -1,0 +1,109 @@
+name: Bug Report
+description: Report a bug in PyPTO Serving, including startup, generation, batching, or runtime errors
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for reporting a bug. Please provide enough detail for us to reproduce the issue.
+
+  - type: textarea
+    id: diagnosis
+    attributes:
+      label: Diagnosis
+      description: "Which component appears to be at fault? (pypto-serving / pypto-lib / pypto / simpler / ptoas) and why."
+      placeholder: |
+        **pypto-serving** - request batching fails before dispatching to the executor
+    validations:
+      required: false
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: Clear description of the bug and how to reproduce it
+      placeholder: |
+        1. Start the server with `./examples/pypto-serving --config ...`
+        2. Send a request or run generation with ...
+        3. Observe the error ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: command_or_request
+    attributes:
+      label: Command or Request
+      description: The exact command, config, or request payload that triggers the bug
+      placeholder: |
+        ```bash
+        ./examples/pypto-serving --config examples/model/qwen3_14b/qwen3_14b_npu_serving.json --interactive
+        ```
+    validations:
+      required: false
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Versions of pypto-serving, pypto-lib, pypto, simpler, ptoas, CANN, and torch if relevant
+      placeholder: |
+        | Component | Version |
+        |---|---|
+        | pypto-serving | `abc1234` |
+        | pypto-lib | `def5678` |
+        | pypto | `ghi9012` |
+        | simpler | `jkl3456` |
+        | ptoas | v0.38 |
+        | CANN | 9.0.0 |
+        | torch / torch-npu | ... |
+    validations:
+      required: true
+
+  - type: dropdown
+    id: host_platform
+    attributes:
+      label: Host Platform
+      description: OS and CPU architecture of the host machine
+      options:
+        - Linux (aarch64)
+        - Linux (x86_64)
+        - macOS (arm64)
+        - Other (please specify in description)
+    validations:
+      required: true
+
+  - type: input
+    id: device_platform
+    attributes:
+      label: Device / Platform
+      description: Serving target, if applicable
+      placeholder: "e.g., a2a3, a2a3sim, a5sim, device auto, device 0"
+    validations:
+      required: false
+
+  - type: input
+    id: model
+    attributes:
+      label: Model
+      description: Model and checkpoint path, if applicable
+      placeholder: "e.g., Qwen3-14B, /data/.../models/Qwen3-14B"
+    validations:
+      required: false
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Relevant logs, tracebacks, or profiling output
+      render: text
+    validations:
+      required: false
+
+  - type: textarea
+    id: additional_context
+    attributes:
+      label: Additional Context
+      description: Any other information or attachments that might help
+    validations:
+      required: false
