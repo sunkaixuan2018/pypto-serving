@@ -20,12 +20,8 @@ examples/
     npu_generate.py            NPU generation/profiling example
     npu_serving.json           sample serving config
     runner/                    Qwen3 executors and runner glue
-<<<<<<< HEAD
-tests/                         CLI and batching tests
-=======
     src/                       PyPTO kernel/program builders
 tests/                         CLI, batching, E2E serving, and benchmark tests
->>>>>>> b2fca02 (Add serving V2: multiprocess worker + dynamic batching + HTTP API)
 ```
 
 ## Quick Checks
@@ -54,38 +50,33 @@ python -m python.cli --help
 One-shot generation, non-L3 path:
 
 ```bash
-task-submit --device auto --max-time 0 --run \
-  "PTO2_RING_HEAP=536870912 PTO2_RING_TASK_WINDOW=131072 PTO2_RING_DEP_POOL=131072 \
-  python examples/model/qwen3_14b/npu_generate.py \
-    --model-dir /data/linyifan/models/Qwen3-14B \
-    --prompt 'Huawei is' \
-    --platform a2a3 \
-    --max-seq-len 512 \
-    --max-new-tokens 5"
+python examples/model/qwen3_14b/npu_generate.py \
+  --model-dir /data/linyifan/models/Qwen3-14B \
+  --prompt 'Huawei is' \
+  --platform a2a3 \
+  --max-seq-len 512 \
+  --max-new-tokens 5
 ```
 
 One-shot generation, L3 path:
 
 ```bash
-task-submit --device auto --max-time 0 --run \
-  "PTO2_RING_HEAP=536870912 PTO2_RING_TASK_WINDOW=131072 PTO2_RING_DEP_POOL=131072 \
-  python examples/model/qwen3_14b/npu_generate.py \
-    --model-dir /data/linyifan/models/Qwen3-14B \
-    --prompt 'Huawei is' \
-    --platform a2a3 \
-    --max-seq-len 512 \
-    --max-new-tokens 5 \
-    --l3"
+python examples/model/qwen3_14b/npu_generate.py \
+  --model-dir /data/linyifan/models/Qwen3-14B \
+  --prompt 'Huawei is' \
+  --platform a2a3 \
+  --max-seq-len 512 \
+  --max-new-tokens 5 \
+  --l3
 ```
 
 Interactive generation:
 
 ```bash
-task-submit --run -i \
-  "./examples/pypto-serving \
-    --config examples/model/qwen3_14b/npu_serving.json \
-    --device 0 \
-    --interactive"
+./examples/pypto-serving \
+  --config examples/model/qwen3_14b/npu_serving.json \
+  --device 0 \
+  --interactive
 ```
 
 At the `[user]` prompt, enter a prompt such as `Huawei is`; use `/exit` or
@@ -96,10 +87,9 @@ At the `[user]` prompt, enter a prompt such as `Huawei is`; use `/exit` or
 Start the serving server with multiprocess worker:
 
 ```bash
-task-submit --device auto --max-time 0 --run \
-  "python -m python.cli.main \
-    --config examples/model/qwen3_14b/npu_serving.json \
-    --serve --port 8899 --device {}"
+python -m python.cli.main \
+  --config examples/model/qwen3_14b/npu_serving.json \
+  --serve --port 8899 --device {}
 ```
 
 Test with curl:
