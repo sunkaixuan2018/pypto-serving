@@ -56,6 +56,12 @@ if 'mpi' in engines
   mpirunExecutable = HiCRProject.get_variable('mpirunExecutable')
 endif
 
+####### Getting TaskR dependency
+
+TaskRProject = subproject('TaskR', required: true, default_options: [])
+TaskRBuildDep = TaskRProject.get_variable('TaskRBuildDep')
+servingDependencies += TaskRBuildDep
+
 ####### Creating serving dependency
 
 servingBuildDep = declare_dependency(
