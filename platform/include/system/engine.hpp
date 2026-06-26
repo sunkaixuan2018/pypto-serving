@@ -33,6 +33,10 @@ class Engine final
       _instanceId(instanceManager->getCurrentInstance()->getId()),
       _deployerInstanceId(deployerInstanceId)
   {
+    // Lifetime contract: Engine must outlive the RPCEngine. HiCR does not
+    // expose an unregister API, so these lambdas cannot be removed in the
+    // destructor. Callers must call terminate()/await() before destroying
+    // the Engine to ensure no RPC dispatch races the destructor.
     _rpcEngine->addRPCTarget(__SERVING_SYSTEM_START_RPC_NAME, _computeManager->createExecutionUnit([this](void *) { start(); }));
     _rpcEngine->addRPCTarget(__SERVING_SYSTEM_STOP_RPC_NAME, _computeManager->createExecutionUnit([this](void *) { stop(); }));
   }

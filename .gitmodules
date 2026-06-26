@@ -4,4 +4,3 @@
 [submodule "platform/extern/HiCR"]
 	path = platform/extern/HiCR
 	url = https://github.com/huawei-csl/HiCR.git
-	branch = master

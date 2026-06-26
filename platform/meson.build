@@ -14,7 +14,7 @@ if get_option('compileWarningsAsErrors') == true
 endif
 
 servingDependencies = []
-servingBuildCppArgs = ['-Wfatal-errors', warningAsErrorFlags]
+servingBuildCppArgs = ['-Wfatal-errors'] + warningAsErrorFlags
 servingBuildIncludes = include_directories(['include'])
 
 # Getting selected distributed engines
@@ -64,6 +64,3 @@ servingBuildDep = declare_dependency(
   dependencies: servingDependencies,
 )
 
-####### Build test / example targets only if HiCR is being loaded as a subproject
-
-endif
