@@ -9,6 +9,9 @@
 
 from __future__ import annotations
 
+import logging
+import os
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -26,6 +29,9 @@ from python.core.types import (
     RuntimeModel,
 )
 from python.profile import profile_span
+
+
+logger = logging.getLogger(__name__)
 
 
 def _kernel_trace_name(kernel_name: str) -> str:
@@ -167,9 +173,11 @@ class Qwen314BModelRunner(ModelRunner):
         self,
         *,
         compiled: _CompiledKernels,
+        device_id: int = 0,
     ) -> None:
         super().__init__()
         self._compiled = compiled
+        self._device_id = device_id
         self._l3_worker: Any | None = None
         self._l3_static_tensors: dict[tuple[int, tuple[int, ...], torch.dtype], object] = {}
         self._static_args: _StaticKernelArgs | None = None
@@ -178,17 +186,292 @@ class Qwen314BModelRunner(ModelRunner):
             self._share_static_kernel_tensors()
             self._static_args = self._build_static_kernel_args()
 
-    def init_kv_cache(self, model_id: str, config: ModelConfig, runtime: RuntimeConfig) -> None:
-        """Create the L3 worker-resident cache before the first request."""
+    #: Scratch KV pages for the profile pass — slot=-1 means only page 0
+    #: is ever touched (reads via block_table=0, writes via slot clamp to 0).
+    _PROFILE_PAGES = 1
+
+    def init_kv_cache(self, model_id: str, config: ModelConfig, runtime: RuntimeConfig) -> int:
+        """Create the L3 worker-resident cache before the first request.
+
+        Order (vLLM-style): run a profile warmup FIRST so the simpler arena
+        is allocated before the KV cache competes for HBM.  The profile uses
+        ``slot_mapping=-1`` / ``block_table=0`` so only a single dummy page
+        is needed.  The KV cache size is then computed by the estimation
+        formula and allocated into the remaining space; if allocation fails
+        the page count is halved and retried.
+        """
         if model_id in self._kv_caches:
-            return
+            num_pages = self._kv_caches[model_id].key_pages.shape[0] // (
+                config.num_hidden_layers * config.num_key_value_heads * runtime.page_size
+            )
+            return num_pages
         self._pending_kv_cache_specs[model_id] = (config, runtime)
+
+        logger.info("[init_kv_cache] creating L3 worker …")
         with profile_span("Qwen314BModelRunner.prepare_l3_worker", cat="executor"):
             self._shared_l3_worker()
+
+        logger.info("[init_kv_cache] uploading static tensors …")
         with profile_span("Qwen314BModelRunner.upload_static_tensors", cat="executor"):
             self._materialize_static_tensors()
-        with profile_span("Qwen314BModelRunner.init_kv_cache", cat="executor"):
-            ModelRunner.init_kv_cache(self, model_id, config, runtime)
+
+        # -- phase 1: profile warmup → arena allocated ----------------------
+        # Uses slot_mapping=-1 so no real KV cache pages are needed; the
+        # 1-page scratch is the dummy target for all reads/writes.
+        logger.info(f"[init_kv_cache] profile warmup (scratch {self._PROFILE_PAGES} page) …")
+        ModelRunner.init_kv_cache(self, model_id, config, runtime, num_pages=self._PROFILE_PAGES)
+        try:
+            self._warmup_dispatch(runtime)
+        finally:
+            self.close_kv_cache()
+            self._kv_caches.pop(model_id, None)
+
+        # -- phase 2: real KV cache, halve-and-retry on OOM -----------------
+        logger.info("[init_kv_cache] computing KV cache pages …")
+        num_pages = self._compute_kv_cache_pages(config, runtime, self._device_id)
+        num_pages = self._alloc_kv_cache_with_retry(model_id, config, runtime, num_pages)
+        self._print_memory_breakdown("after KV cache alloc", config, runtime, num_pages, self._device_id)
+        logger.info("[init_kv_cache] done")
+        return num_pages
+
+    def _alloc_kv_cache_with_retry(
+        self, model_id: str, config: ModelConfig, runtime: RuntimeConfig, num_pages: int,
+    ) -> int:
+        """Allocate the KV cache, halving the page count on OOM."""
+        floor = max(runtime.max_batch_size, 1)
+        requested = num_pages
+        num_pages = max(num_pages, floor)  # always try at least the floor
+        while num_pages >= floor:
+            try:
+                logger.info(f"[init_kv_cache] num_pages={num_pages}, allocating …")
+                ModelRunner.init_kv_cache(self, model_id, config, runtime, num_pages=num_pages)
+                bytes_per_page = (
+                    config.num_hidden_layers * 2 * config.num_key_value_heads
+                    * runtime.page_size * config.head_dim
+                    * getattr(torch, runtime.kv_dtype).itemsize
+                )
+                logger.info(
+                    f"[init_kv_cache] allocated {num_pages} pages "
+                    f"(requested {requested}, downgraded after OOM): "
+                    f"{num_pages * bytes_per_page / 1e9:.2f} GB KV cache, "
+                    f"{num_pages * runtime.page_size} context tokens",
+                    
+                )
+                return num_pages
+            except (RuntimeError, MemoryError) as e:
+                prev = num_pages
+                num_pages //= 2
+                if num_pages < floor and prev > floor:
+                    num_pages = floor
+                logger.info(
+                    f"[init_kv_cache] alloc failed ({e}); retrying {prev} -> {num_pages}",
+                )
+        raise RuntimeError(
+            f"KV cache allocation failed even at floor {floor} pages"
+        )
+
+    @staticmethod
+    def _compute_kv_cache_pages(config: ModelConfig, runtime: RuntimeConfig, device_id: int = 0) -> int:
+        """Compute KV cache pages, vLLM-style: total x utilization − peak_non_kv.
+
+        Called AFTER the profile warm-up, so weights, the simpler ring-heap
+        arena, compiled buffers and any persistent scratch are already
+        allocated — ``peak_non_kv = total − free`` captures all of it. The KV
+        budget is ``total x utilization − peak_non_kv``, leaving
+        ``total x (1 − utilization)`` as a fixed absolute headroom (more robust
+        than ``free x fraction`` whose headroom shrinks when free is small).
+        """
+        free_bytes, total_bytes = torch.npu.mem_get_info(f"npu:{device_id}")
+        dtype_bytes = getattr(torch, runtime.kv_dtype).itemsize
+        bytes_per_page = (
+            config.num_hidden_layers * 2 * config.num_key_value_heads
+            * runtime.page_size * config.head_dim * dtype_bytes
+        )
+        utilization = getattr(runtime, "npu_memory_utilization", 0.90)
+        peak_non_kv = total_bytes - free_bytes
+        kv_budget = int(total_bytes * utilization - peak_non_kv)
+        num_pages = max(kv_budget // bytes_per_page, 1)
+        logger.info(
+            "KV cache sizing (vLLM-style): total=%.2f GB, utilization=%.2f, "
+            "peak_non_kv=%.2f GB, kv_budget=%.2f GB, requested_pages=%d (%.1f MB/page)",
+            total_bytes / 1e9, utilization, peak_non_kv / 1e9,
+            kv_budget / 1e9, num_pages, bytes_per_page / 1e6,
+        )
+        return num_pages
+
+    @staticmethod
+    def _print_memory_breakdown(
+        label: str, config: ModelConfig, runtime: RuntimeConfig, num_pages: int,
+        device_id: int = 0,
+    ) -> None:
+        """Print a per-component NPU memory breakdown at ``label``.
+
+        ``torch.npu.mem_get_info`` only reports a single total, so each part
+        is reconstructed rather than queried: weights (estimated from the
+        model config), KV cache (exact = num_pages x bytes_per_page), simpler
+        ring-heap arena (from the ``PTO2_RING_HEAP`` env x 4), and the
+        residual (compiled buffers + transient activation scratch + overhead).
+        """
+        free_bytes, total_bytes = torch.npu.mem_get_info(f"npu:{device_id}")
+        used_bytes = total_bytes - free_bytes
+        dtype_bytes = getattr(torch, runtime.kv_dtype).itemsize
+
+        # Weights — GQA: Q/O are hiddenxhidden, K/V are hiddenxkv_hidden.
+        hidden = config.hidden_size
+        kv_hidden = config.num_key_value_heads * config.head_dim
+        wt_params = (
+            config.num_hidden_layers * (
+                hidden * hidden * 2
+                + hidden * kv_hidden * 2
+                + hidden * config.intermediate_size * 3
+                + hidden * 4
+            )
+            + config.vocab_size * hidden
+        )
+        weight_bytes = int(wt_params * dtype_bytes)
+
+        # KV cache — exact (num_pages already reflects the real allocation).
+        bytes_per_page = (
+            config.num_hidden_layers * 2 * config.num_key_value_heads
+            * runtime.page_size * config.head_dim * dtype_bytes
+        )
+        kv_bytes = num_pages * bytes_per_page
+
+        # Simpler ring-heap arena — from env (matches _compute_kv_cache_pages).
+        ring_heap = int(os.environ.get("PTO2_RING_HEAP", 256 * 1024 * 1024))
+        arena_bytes = ring_heap * 4 + 128 * 1024 * 1024
+
+        residual = used_bytes - weight_bytes - kv_bytes - arena_bytes
+
+        logger.info(f"[mem-breakdown] {label}:")
+        logger.info(
+            f"  total used (measured):      {used_bytes / 1e9:7.2f} GB "
+            f"/ {total_bytes / 1e9:.2f} GB (free {free_bytes / 1e9:.2f} GB)",
+            
+        )
+        logger.info(f"  ├─ weights (estimated):     {weight_bytes / 1e9:7.2f} GB")
+        kv_tokens = num_pages * runtime.page_size
+        max_seq_len = runtime.max_seq_len
+        worst_case_demand = runtime.max_batch_size * max_seq_len
+        max_len_reqs = kv_tokens // max(max_seq_len, 1)
+        logger.info(
+            f"  ├─ KV cache ({num_pages} pages):     {kv_bytes / 1e9:7.2f} GB "
+            f"({bytes_per_page / 1e6:.1f} MB/page)",
+            
+        )
+        logger.info(
+            f"  │     capacity = {kv_tokens} tokens "
+            f"≈ {max_len_reqs} x full-len({max_seq_len}) reqs; "
+            f"worst-case need {runtime.max_batch_size}x{max_seq_len}="
+            f"{worst_case_demand} tokens"
+            + ("  [OK]" if kv_tokens >= worst_case_demand else "  [TIGHT]"),
+            
+        )
+        logger.info(f"  ├─ simpler arena (env x 4): {arena_bytes / 1e9:7.2f} GB")
+        logger.info(
+            f"  └─ residual (buffers/scratch): {residual / 1e9:6.2f} GB "
+            f"(compiled buffers + transient activation scratch + overhead)",
+            
+        )
+        logger.info(
+            "  note: weights/arena are estimates, KV is exact; total is from "
+            "mem_get_info (may under-count simpler's rtMalloc pool).",
+            
+        )
+
+    def warmup(self, model: RuntimeModel) -> None:
+        """Dispatch a dummy prefill + decode through the L3 worker."""
+        self._warmup_dispatch(model.runtime)
+
+    def _warmup_dispatch(self, runtime: RuntimeConfig) -> None:
+        """Production-scale prefill + decode warm-up with slot_mapping=-1.
+
+        Sizes the prefill to one serving scheduling step — total tokens =
+        ``max_num_batched_tokens`` spread across ``max_batch`` requests.
+        This deliberately exercises the kernel at the configured capacity so
+        that a too-large ``max_num_batched_tokens`` (which would hit the
+        single-die attention heap ceiling around seq≈415 in the 40-layer
+        fused prefill) fails at startup rather than on the first real
+        request.
+        """
+        batch = runtime.max_batch_size
+        max_seq = runtime.max_seq_len
+        mnb = getattr(runtime, "max_num_batched_tokens", 4096)
+        step_tokens = min(mnb, batch * max_seq)
+        per_req = max(step_tokens // batch, 1)
+        total_tokens = per_req * batch
+
+        logger.info(
+            f"[warmup] starting (batch={batch}, max_num_batched_tokens={mnb}, "
+            f"max_seq={max_seq}, per_req={per_req}, total_tokens={total_tokens}, slot=-1)",
+            
+        )
+        compiled = self._compiled
+        kv_cache = list(self._kv_caches.values())[0]
+
+        # -- prefill ---------------------------------------------------------
+        compiled.prefill_hidden_buffer[:total_tokens].zero_()
+        compiled.prefill_seq_lens_buffer.zero_()
+        compiled.prefill_chunk_lens_buffer.zero_()
+        compiled.prefill_chunk_offsets_buffer.zero_()
+        compiled.prefill_block_table_buffer.fill_(0)    # all reads from page 0
+        compiled.prefill_slot_mapping_buffer.fill_(-1)  # all writes to page 0
+
+        token_offset = 0
+        for b in range(batch):
+            compiled.prefill_seq_lens_buffer[b] = per_req
+            compiled.prefill_chunk_lens_buffer[b] = per_req
+            compiled.prefill_chunk_offsets_buffer[b] = token_offset
+            token_offset += per_req
+
+        prefill_inputs = _PrefillInputs(
+            actual_batch=batch,
+            hidden=compiled.prefill_hidden_buffer[:total_tokens],
+            seq_lens=compiled.prefill_seq_lens_buffer,
+            chunk_lens=compiled.prefill_chunk_lens_buffer,
+            chunk_offsets=compiled.prefill_chunk_offsets_buffer,
+            block_table=compiled.prefill_block_table_buffer,
+            slot_mapping=compiled.prefill_slot_mapping_buffer,
+        )
+
+        logger.info(f"[warmup] prefill dispatch … (batch={batch}, tokens={total_tokens})")
+        t0 = time.perf_counter()
+        self._run_distributed_program(
+            compiled.prefill,
+            *self._prefill_kernel_args(
+                prefill_inputs, kv_cache.key_pages, kv_cache.value_pages,
+                compiled.prefill_logits_buffer,
+            ),
+        )
+        logger.info(f"[warmup] prefill done ({time.perf_counter() - t0:.2f} s)")
+
+        # -- decode (full fixed batch, minimal seq) -------------------------
+        compiled.decode_hidden_buffer.zero_()
+        compiled.decode_seq_lens_buffer.zero_()
+        compiled.decode_block_table_buffer.fill_(0)     # all reads from page 0
+        compiled.decode_slot_mapping_buffer.fill_(-1)   # all writes to page 0
+
+        for b in range(batch):
+            compiled.decode_seq_lens_buffer[b] = min(per_req + 1, max_seq)
+
+        decode_kernel_inputs = _DecodeKernelInputs(
+            actual_batch=batch,
+            hidden=compiled.decode_hidden_buffer,
+            seq_lens=compiled.decode_seq_lens_buffer,
+            block_table=compiled.decode_block_table_buffer,
+            slot_mapping=compiled.decode_slot_mapping_buffer,
+            logits=compiled.decode_logits_buffer,
+        )
+
+        logger.info(f"[warmup] decode dispatch … (batch={batch}, seq_len={per_req + 1})")
+        t0 = time.perf_counter()
+        self._run_distributed_program(
+            compiled.decode,
+            *self._decode_kernel_args(decode_kernel_inputs, kv_cache.key_pages, kv_cache.value_pages),
+        )
+        logger.info(f"[warmup] decode done ({time.perf_counter() - t0:.2f} s)")
+
+        logger.info("[warmup] complete")
 
     def _alloc_kv_cache_tensor(self, shape: tuple[int, ...], dtype: torch.dtype) -> DeviceTensor:
         """Allocate one worker-resident KV cache tensor shared by prefill/decode."""

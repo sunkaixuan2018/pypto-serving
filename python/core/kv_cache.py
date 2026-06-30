@@ -103,15 +103,23 @@ class FreeKVCacheBlockQueue:
 
 @dataclass
 class _CachePool:
-    """Paged KV cache storage for one registered model."""
+    """Paged KV cache storage for one registered model.
+
+    ``key_pages`` / ``value_pages`` are allocated lazily on first access
+    via ``write_tokens`` or ``read_context``.  NPU serving paths never
+    trigger the allocation — they manage KV cache on-device through the
+    runner.
+    """
 
     page_size: int
     num_layers: int
     num_kv_heads: int
     head_dim: int
     max_blocks_per_seq: int
-    key_pages: torch.Tensor
-    value_pages: torch.Tensor
+    num_pages: int
+    kv_dtype: torch.dtype
+    key_pages: torch.Tensor | None = None
+    value_pages: torch.Tensor | None = None
 
 
 class KvCacheManager:
@@ -156,7 +164,7 @@ class KvCacheManager:
             self.free_queue.append(block)
 
     def register_model(self, model_id: str, config: ModelConfig, runtime: RuntimeConfig) -> None:
-        """Create the KV page pool for a model if it is not already registered."""
+        """Register model metadata; host-side tensors are allocated lazily."""
         if model_id in self._pools:
             return
         max_blocks_per_seq = math.ceil(runtime.max_seq_len / runtime.page_size)
@@ -165,24 +173,14 @@ class KvCacheManager:
             num_pages = runtime.max_batch_size * max_blocks_per_seq
         self._init_blocks(num_pages, runtime.page_size)
         kv_dtype = getattr(torch, runtime.kv_dtype)
-        key_pages = torch.zeros(
-            config.num_hidden_layers,
-            num_pages,
-            config.num_key_value_heads,
-            runtime.page_size,
-            config.head_dim,
-            dtype=kv_dtype,
-            device=runtime.device,
-        )
-        value_pages = torch.zeros_like(key_pages)
         self._pools[model_id] = _CachePool(
             page_size=runtime.page_size,
             num_layers=config.num_hidden_layers,
             num_kv_heads=config.num_key_value_heads,
             head_dim=config.head_dim,
             max_blocks_per_seq=max_blocks_per_seq,
-            key_pages=key_pages,
-            value_pages=value_pages,
+            num_pages=num_pages,
+            kv_dtype=kv_dtype,
         )
 
     def allocate_for_prompt(self, model_id: str, request_id: str, prompt_len: int) -> KvAllocation:
@@ -337,6 +335,29 @@ class KvCacheManager:
             dtype=torch.int32,
         )
 
+    def _ensure_host_pool(self, model_id: str) -> _CachePool:
+        """Return the pool, allocating host-side tensors on first access.
+
+        The host-side :class:`torch.Tensor` pool is only needed by the CPU
+        executor (``write_tokens`` / ``read_context``).  NPU serving paths
+        never call these methods, so the tensors are never allocated.
+        """
+        pool = self._pool(model_id)
+        if pool.key_pages is None:
+            key_pages = torch.zeros(
+                pool.num_layers,
+                pool.num_pages,
+                pool.num_kv_heads,
+                pool.page_size,
+                pool.head_dim,
+                dtype=pool.kv_dtype,
+                device="cpu",
+            )
+            value_pages = torch.zeros_like(key_pages)
+            pool.key_pages = key_pages
+            pool.value_pages = value_pages
+        return pool
+
     def write_tokens(
         self,
         layer_idx: int,
@@ -346,7 +367,7 @@ class KvCacheManager:
         values: torch.Tensor,
     ) -> None:
         """Write key/value rows for consecutive tokens into paged cache."""
-        pool = self._pool(alloc.model_id)
+        pool = self._ensure_host_pool(alloc.model_id)
         if keys.shape != values.shape:
             raise ValueError("keys and values must have the same shape")
         for row in range(keys.shape[0]):
@@ -365,7 +386,7 @@ class KvCacheManager:
         upto_tokens: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Read contiguous K/V context for one request and layer."""
-        pool = self._pool(alloc.model_id)
+        pool = self._ensure_host_pool(alloc.model_id)
         token_count = alloc.tokens_used if upto_tokens is None else upto_tokens
         keys = torch.empty(
             token_count,
@@ -395,7 +416,7 @@ class KvCacheManager:
         head_dim]``. Use this API for kernels that receive one layer's cache
         at a time.
         """
-        pool = self._pool(model_id)
+        pool = self._ensure_host_pool(model_id)
         return (
             pool.key_pages[layer_idx].reshape(-1, pool.head_dim),
             pool.value_pages[layer_idx].reshape(-1, pool.head_dim),
