@@ -9,12 +9,15 @@
 
 from __future__ import annotations
 
+import logging
 import time
 from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum, auto
 
 from .kv_cache import KvCacheManager
+
+logger = logging.getLogger(__name__)
 
 
 class RequestStatus(Enum):
@@ -128,8 +131,35 @@ class Scheduler:
         self.requests: dict[str, Request] = {}
 
     def add_request(self, request: Request) -> None:
-        if len(request.prompt_token_ids) > self.config.max_seq_len:
-            request.prompt_token_ids = request.prompt_token_ids[: self.config.max_seq_len]
+        prompt_len = len(request.prompt_token_ids)
+        max_seq_len = self.config.max_seq_len
+        if prompt_len > max_seq_len:
+            # vLLM-style: reject rather than silently truncate. A prompt that
+            # cannot fit max_seq_len can never be served, so failing loudly is
+            # safer than silently dropping the tail of the prompt.
+            raise ValueError(
+                f"Request {request.request_id} prompt length {prompt_len} "
+                f"exceeds max_seq_len {max_seq_len}; request rejected."
+            )
+        # Cap generation so prompt + generated tokens never exceed max_seq_len
+        # (vLLM-style: effective max_tokens = max_seq_len - prompt_len). This
+        # keeps every request within the KV-cache capacity budgeted per request
+        # and avoids overflow-driven preemption.
+        remaining = max_seq_len - prompt_len
+        if remaining <= 0:
+            raise ValueError(
+                f"Request {request.request_id} prompt length {prompt_len} "
+                f"leaves no room for generation within max_seq_len {max_seq_len}; "
+                f"request rejected."
+            )
+        if request.max_new_tokens > remaining:
+            logger.warning(
+                "Request %s: capping max_new_tokens %d -> %d to fit max_seq_len %d "
+                "(prompt_len=%d).",
+                request.request_id, request.max_new_tokens, remaining,
+                max_seq_len, prompt_len,
+            )
+            request.max_new_tokens = remaining
         if self.config.enable_prefix_cache:
             request.block_hashes = self.kv_cache_manager.compute_block_hashes(request.prompt_token_ids)
         request.status = RequestStatus.WAITING
@@ -240,6 +270,29 @@ class Scheduler:
             num_new = min(num_new, token_budget)
 
             if num_new <= 0:
+                # Fully prefix-cached: num_computed_tokens >= num_prompt_tokens,
+                # prefill done, KV reused from cache. Schedule as decode so the
+                # worker generates the first token from cached KV. Without this
+                # the request is skipped forever (num_new=0 → put back → loop).
+                if request.num_computed_tokens >= request.num_prompt_tokens:
+                    logger.info(
+                        "request %s: prefix cache full hit (%d tokens), "
+                        "skipping prefill → decode",
+                        request.request_id, request.num_computed_tokens,
+                    )
+                    request.status = RequestStatus.RUNNING
+                    self.running.append(request)
+                    all_block_ids = request.cached_block_ids + request.allocated_block_ids
+                    output.scheduled_requests.append(
+                        ScheduledRequest(
+                            request=request,
+                            num_new_tokens=0,
+                            is_prefill=False,
+                            num_computed_tokens=request.num_computed_tokens,
+                            block_ids=list(all_block_ids),
+                        )
+                    )
+                    continue
                 remaining_waiting.append(request)
                 continue
 
@@ -331,6 +384,10 @@ class Scheduler:
         if request.eos_token_id is not None and last_token == request.eos_token_id:
             return RequestStatus.FINISHED_EOS
         if len(request.output_token_ids) >= request.max_new_tokens:
+            return RequestStatus.FINISHED_LENGTH
+        # Defence in depth: stop once the full sequence (prompt + generated)
+        # reaches max_seq_len, regardless of max_new_tokens.
+        if request.num_tokens >= self.config.max_seq_len:
             return RequestStatus.FINISHED_LENGTH
         return None
 
