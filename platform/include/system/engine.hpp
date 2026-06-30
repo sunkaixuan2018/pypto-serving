@@ -1,9 +1,11 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <map>
 #include <memory>
 #include <string>
+#include <thread>
 
 #include <hicr/core/definitions.hpp>
 #include <hicr/core/exceptions.hpp>
@@ -83,7 +85,7 @@ class Engine final
     while (_isRunning.load() == true)
     {
       if (_rpcEngine->tryListen()) { _rpcEngine->parseAndExecuteRPC(); }
-      else { std::this_thread::yield(); }
+      else { std::this_thread::sleep_for(std::chrono::milliseconds(1)); }
     }
 
     for (const auto &[name, module] : _modules) { module->terminate(); }

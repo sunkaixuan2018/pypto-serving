@@ -77,6 +77,10 @@ class Output final : public Base
     }
   }
 
+  __INLINE__ const HiCR::Instance::instanceId_t getTargetInstance() const { return _targetInstance; }
+
+  private:
+
   __INLINE__ void pushMessage(const Message message) const
   {
     if (isFull(message.getSize()) == true) HICR_THROW_RUNTIME("Trying to push a message when channel is full. This is a bug in serving.");
@@ -88,10 +92,6 @@ class Output final : public Base
     cfg.payloadMemoryManager->deregisterLocalMemorySlot(payloadSlot);
     cfg.coordinationMemoryManager->deregisterLocalMemorySlot(metadataSlot);
   }
-
-  __INLINE__ const HiCR::Instance::instanceId_t getTargetInstance() const { return _targetInstance; }
-
-  private:
 
   __INLINE__ void createChannels() override
   {
