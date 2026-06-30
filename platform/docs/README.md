@@ -25,25 +25,19 @@ platform/
 
 ## Module Areas
 
-- [Modules](modules/README.md): common module lifecycle and first-party modules.
-- [Configuration](modules/configuration.md): deployment graph objects and validation rules.
-- [Service Module](modules/service.md): Periodic service aggregation.
-- [Channel Controller](modules/channel-controller.md): desired-state channel reconciliation.
-- [Broadcast Deployment](modules/broadcast-deployment.md): deployer-to-worker deployment distribution.
 - [System](system/README.md): engine lifecycle and cross-instance start/stop control.
 - [Channels](system/channels.md): payload, coordination, metadata, input, output, and message primitives.
-- [Examples](examples/README.md): example programs and what they demonstrate.
+
+Configuration types, the service module, channel controller, and broadcast deployment are tracked in issue #32 and are not part of this initial PR.
 
 ## Runtime Shape
 
 The current platform runtime is built around `serving::system::Engine`. The engine owns a set of `serving::modules::Module` instances, initializes them, starts them across instances through RPC, waits for termination, and finalizes them.
 
-The implemented platform pieces already cover these issue #32 building blocks:
+This initial PR covers the following building blocks:
 
-- Deployment graph representation through `Deployment`, `Partition`, `Task`, `Replica`, `Edge`, and `RequestManager`.
-- Deployment broadcast from a deployer instance to other instances.
-- Desired-state channel creation through `channelController::Module`.
-- Host-side service scheduling through TaskR.
-- Control/message metadata through `Message` and `MessageTypeRegistry`.
+- Engine lifecycle: cross-instance start/stop over RPC (`serving::system::Engine`).
+- Module base interface: initialize/run/terminate/await/finalize lifecycle with optional `taskr::Service` (`serving::modules::Module`).
+- Channel primitives: `Input`, `Output`, `Message`, and `MessageTypeRegistry` for host-side control traffic.
 
-Dynamic scaling, topology-aware replacement, fault recovery, and Python bindings are not implemented in this subtree yet.
+Deployment graph representation, deployment broadcast, desired-state channel creation, dynamic scaling, topology-aware replacement, fault recovery, and Python bindings are not implemented in this PR.

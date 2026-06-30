@@ -19,7 +19,7 @@ The channel layer wraps SPSC channels for platform messages. It separates data p
 - Local coordination buffers.
 - Exchanged global memory slots.
 - Ready state.
-- A mutex for locking around channel operations.
+- A mutex used exclusively by `pushMessageLocking` to serialize competing callers on the producer side.
 
 `Base::initialize(tag)` resolves exchanged global slots through the configured communication managers, creates concrete producer/consumer channels, and marks the channel ready.
 
@@ -72,15 +72,15 @@ It exposes:
 
 Metadata fields:
 
-- `type`: 10-bit message type.
-- `groupId`: 20-bit group id.
+- `type`: 16-bit message type.
+- `groupId`: 14-bit group id.
 - `sequenceId`: 34-bit sequence id.
 
 `metadata_t::getId()` packs those fields into a single 64-bit id.
 
 ## Message Type Registry
 
-`MessageTypeRegistry` maps string message-type names to `Message::messageType_t` values using FNV-1a hashing truncated to the message type bit range.
+`MessageTypeRegistry` maps string message-type names to `Message::messageType_t` values using FNV-1a hashing, which ensures every node derives the same id for a given type name regardless of registration order. The hash is truncated to the 16-bit type field range (65 536 slots).
 
 The registry rejects:
 
@@ -96,4 +96,4 @@ The channel layer is the implementation foundation for platform control and data
 ## Current Limitations
 
 - `Message` does not own payload memory; callers must ensure payload lifetime is valid during push or read.
-- Channels are SPSC-oriented.
+- The underlying HiCR channels are SPSC. `pushMessageLocking` adds a mutex to safely serialize multiple callers pushing to the same `Output`, but the data path itself remains single-producer at the HiCR level.

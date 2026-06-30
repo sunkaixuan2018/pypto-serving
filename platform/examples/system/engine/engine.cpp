@@ -30,25 +30,18 @@ int main(int argc, char *argv[])
   const auto topology = hwlocTopologyManager.queryTopology();
 
   // Selecting first device
-  auto d = *topology.getDevices().begin();
+  const auto &devices = topology.getDevices();
+  if (devices.empty()) { fprintf(stderr, "No HWloc devices found.\n"); return 1; }
+  auto d = *devices.begin();
 
   // Getting memory space list from device
-  auto memSpaces = d->getMemorySpaceList();
-
-  // Grabbing first memory space for buffering
+  const auto &memSpaces = d->getMemorySpaceList();
+  if (memSpaces.empty()) { fprintf(stderr, "No memory spaces on device.\n"); return 1; }
   auto bufferMemorySpace = *memSpaces.begin();
 
-  // Now getting compute resource list from device
-  auto computeResourcesIt = d->getComputeResourceList().begin();
-
-  // Use only 2 cores
-  std::vector<std::shared_ptr<HiCR::ComputeResource>> computeResources;
-  for (int i = 0; i < 2; i++)
-  {
-    computeResources.push_back(*computeResourcesIt);
-    computeResourcesIt++;
-  }
   // Grabbing first compute resource for computing incoming RPCs
+  const auto &computeResources = d->getComputeResourceList();
+  if (computeResources.empty()) { fprintf(stderr, "No compute resources on device.\n"); return 1; }
   auto computeResource = *computeResources.begin();
 
   // Getting managers
