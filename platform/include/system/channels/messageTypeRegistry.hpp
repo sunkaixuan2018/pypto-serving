@@ -62,7 +62,7 @@ class MessageTypeRegistry
       hash ^= static_cast<uint64_t>(c);
       hash *= prime;
     }
-    return static_cast<messageType_t>(hash & Message::MAX_TYPE); // Ensure the hash fits within the allowed bits for message type
+    return static_cast<messageType_t>(hash & Message::MAX_TYPE);
   }
 
   std::unordered_map<std::string, messageType_t> _nameToType;

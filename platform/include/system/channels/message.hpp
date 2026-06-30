@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cassert>
 #include <cstdint>
 #include <cstdlib>
 
@@ -14,20 +15,20 @@ class Message final
 {
   public:
 
-  // 10 bits for type (1024))
+  // 16 bits for type (65536)
   using messageType_t = uint16_t;
 
-  // 20 bits for type (1M))
-  using groupId_t = uint32_t;
-  // 34 bits for type (17B))
+  // 14 bits for group (16384)
+  using groupId_t = uint16_t;
+  // 34 bits for sequence (17B)
   using sequenceId_t = uint64_t;
 
   // Id type
   using messageId_t = uint64_t;
 
-  static constexpr messageId_t TYPE_BITS     = 10; // 10 bits for type (1024))
-  static constexpr messageId_t GROUP_BITS    = 20; // 20 bits for type (1M))
-  static constexpr messageId_t SEQUENCE_BITS = 34; // 34 bits for type (17B))
+  static constexpr messageId_t TYPE_BITS     = 16; // 16 bits for type (65536)
+  static constexpr messageId_t GROUP_BITS    = 14; // 14 bits for group (16384)
+  static constexpr messageId_t SEQUENCE_BITS = 34; // 34 bits for sequence (17B)
 
   static constexpr messageId_t MAX_TYPE     = (messageId_t{1} << TYPE_BITS) - 1;
   static constexpr messageId_t MAX_GROUP    = (messageId_t{1} << GROUP_BITS) - 1;
@@ -47,6 +48,7 @@ class Message final
 
     messageId_t getId() const
     {
+      assert(isValid());
       return (static_cast<messageId_t>(type) << (GROUP_BITS + SEQUENCE_BITS)) | (static_cast<messageId_t>(groupId) << SEQUENCE_BITS) | static_cast<messageId_t>(sequenceId);
     }
   };

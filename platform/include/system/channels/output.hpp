@@ -1,6 +1,7 @@
 #pragma once
 #include <functional>
 #include <memory>
+#include <thread>
 #include <vector>
 
 #include <hicr/core/exceptions.hpp>
@@ -70,7 +71,7 @@ class Output final : public Base
     {
       lock();
       full = isFull(message.getSize());
-      if (full == true) unlock();
+      if (full == true) { unlock(); std::this_thread::yield(); }
     }
     pushMessage(message);
     unlock();
