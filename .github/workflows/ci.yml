@@ -175,3 +175,11 @@ jobs:
         run: |
           source activate.sh
           python -m pytest tests/test_qwen3_accuracy.py -q -s
+
+      - name: Run Qwen3 serving guard (prefix cache, chunked prefill, multi-batch)
+        env:
+          PYTHONPATH: ${{ github.workspace }}/dist-checkout
+          PYPTO_QWEN3_MODEL_DIR: /data/l00955553/model/Qwen3-14B
+        run: |
+          source activate.sh
+          python -m pytest tests/test_qwen3_serving.py -q -s

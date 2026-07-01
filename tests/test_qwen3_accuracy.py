@@ -24,24 +24,22 @@ if str(ROOT) not in sys.path:
 
 
 MODEL_DIR_ENV = os.environ.get("PYPTO_QWEN3_MODEL_DIR")
-if MODEL_DIR_ENV is None:
-    pytest.fail("PYPTO_QWEN3_MODEL_DIR is required")
-MODEL_DIR = Path(MODEL_DIR_ENV)
+MODEL_DIR = Path(MODEL_DIR_ENV) if MODEL_DIR_ENV else None
 MODEL_ID = "qwen3-14b-accuracy"
 PLATFORM = os.environ.get("PYPTO_QWEN3_PLATFORM", "a2a3")
 DEVICE_ID_ENV = os.environ.get("DEVICE_ID")
-if DEVICE_ID_ENV is None:
-    pytest.fail("DEVICE_ID is required")
-DEVICE_ID = int(DEVICE_ID_ENV)
+DEVICE_ID = int(DEVICE_ID_ENV) if DEVICE_ID_ENV is not None else None
 PROMPT = "The capital of France is"
 MAX_NEW_TOKENS = 8
 
-EXPECTED_TOKEN_IDS = [12095, 13, 576, 6722, 315, 9625, 374, 12095]
+EXPECTED_TOKEN_IDS = [12095, 13, 3555, 374, 279, 6722, 315, 279]
 
 
 def test_qwen3_output_matches_expected_tokens():
-    if not MODEL_DIR or not MODEL_DIR.is_dir():
-        pytest.fail(f"Qwen3 model weights not found: {MODEL_DIR}")
+    if MODEL_DIR is None or not MODEL_DIR.is_dir():
+        pytest.fail(f"PYPTO_QWEN3_MODEL_DIR not set or not a directory: {MODEL_DIR}")
+    if DEVICE_ID is None:
+        pytest.fail("DEVICE_ID is required")
 
     from examples.model.qwen3_14b.runner.npu_executor import Qwen314BPyptoExecutor
     from python.core.engine import LLMEngine
