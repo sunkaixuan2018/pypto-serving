@@ -31,17 +31,29 @@ int main(int argc, char *argv[])
 
   // Selecting first device
   const auto &devices = topology.getDevices();
-  if (devices.empty()) { fprintf(stderr, "No HWloc devices found.\n"); return 1; }
+  if (devices.empty())
+  {
+    fprintf(stderr, "No HWloc devices found.\n");
+    return 1;
+  }
   auto d = *devices.begin();
 
   // Getting memory space list from device
   const auto &memSpaces = d->getMemorySpaceList();
-  if (memSpaces.empty()) { fprintf(stderr, "No memory spaces on device.\n"); return 1; }
+  if (memSpaces.empty())
+  {
+    fprintf(stderr, "No memory spaces on device.\n");
+    return 1;
+  }
   auto bufferMemorySpace = *memSpaces.begin();
 
   // Grabbing first compute resource for computing incoming RPCs
   const auto &computeResources = d->getComputeResourceList();
-  if (computeResources.empty()) { fprintf(stderr, "No compute resources on device.\n"); return 1; }
+  if (computeResources.empty())
+  {
+    fprintf(stderr, "No compute resources on device.\n");
+    return 1;
+  }
   auto computeResource = *computeResources.begin();
 
   // Getting managers

@@ -49,8 +49,7 @@ class Message final
     messageId_t getId() const
     {
       assert(isValid());
-      return ((static_cast<messageId_t>(type) & MAX_TYPE) << (GROUP_BITS + SEQUENCE_BITS)) |
-             ((static_cast<messageId_t>(groupId) & MAX_GROUP) << SEQUENCE_BITS) |
+      return ((static_cast<messageId_t>(type) & MAX_TYPE) << (GROUP_BITS + SEQUENCE_BITS)) | ((static_cast<messageId_t>(groupId) & MAX_GROUP) << SEQUENCE_BITS) |
              (static_cast<messageId_t>(sequenceId) & MAX_SEQUENCE);
     }
   };

@@ -71,7 +71,11 @@ class Output final : public Base
     while (true)
     {
       std::unique_lock<std::mutex> guard(_lock);
-      if (!isFull(message.getSize())) { pushMessage(message); return; }
+      if (!isFull(message.getSize()))
+      {
+        pushMessage(message);
+        return;
+      }
       guard.unlock();
       std::this_thread::sleep_for(std::chrono::microseconds(1));
     }
