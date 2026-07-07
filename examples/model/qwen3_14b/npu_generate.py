@@ -368,6 +368,24 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--max-seq-len", type=int, default=4096)
     parser.add_argument("--max-new-tokens", type=int, default=32)
+    parser.add_argument("--max-num-seqs", type=int, default=16, help="Max batch size / concurrent requests.")
+    parser.add_argument("--block-size", type=int, default=128, help="KV cache page size.")
+    parser.add_argument(
+        "--max-num-batched-tokens",
+        type=int,
+        default=4096,
+        help="Total tokens per scheduling step (used by warmup). NOTE: the 40-layer "
+        "fused prefill deadlocks the single-die ring-heap above ~415 total tokens, "
+        "so set this low enough that the per-request count stays under the ceiling.",
+    )
+    parser.add_argument(
+        "--npu-memory-utilization",
+        type=float,
+        default=0.90,
+        help="Fraction of total NPU HBM the server is allowed to use (weights + KV).",
+    )
+    parser.add_argument("--dtype", default="bfloat16", help="Weight data type.")
+    parser.add_argument("--kv-cache-dtype", default="bfloat16", help="KV cache data type.")
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top-p", type=float, default=1.0)
     parser.add_argument("--top-k", type=int, default=None)
@@ -397,6 +415,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_parser().parse_args()
+    import logging
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+    for _n in ("simpler_setup", "pypto", "simpler"):
+        logging.getLogger(_n).setLevel(logging.WARNING)
     get_profiler(process_name="npu_generate")
     model_dir = Path(args.model_dir).resolve()
     if not model_dir.is_dir():
@@ -439,13 +461,19 @@ def main() -> None:
             model_dir=str(model_dir),
             model_format="huggingface",
             runtime_config=RuntimeConfig(
-                page_size=128,
-                max_batch_size=16,
+                page_size=args.block_size,
+                max_batch_size=args.max_num_seqs,
                 max_seq_len=args.max_seq_len,
                 max_new_tokens=args.max_new_tokens,
                 device="cpu",
-                kv_dtype="bfloat16",
-                weight_dtype="float32",
+                kv_dtype=args.kv_cache_dtype,
+                weight_dtype=args.dtype,
+                npu_memory_utilization=args.npu_memory_utilization,
+                max_num_batched_tokens=args.max_num_batched_tokens,
+                # Conservative default — the decode kernel is compiled
+                # with this baked-in shape and cannot be resized later.
+                # 200 pages x 128 tokens = 25 600 tokens total capacity.
+                total_kv_pages=200,
             ),
         )
         if collector is not None:

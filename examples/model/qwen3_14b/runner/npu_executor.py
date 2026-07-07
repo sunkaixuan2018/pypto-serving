@@ -138,6 +138,7 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
             raise TypeError("Qwen314BPyptoExecutor requires Qwen3-14B compiled kernels.")
         return Qwen314BModelRunner(
             compiled=compiled,
+            device_id=self._device_ids[0],
         )
 
     def _compile_model(self, model: RuntimeModel) -> _CompiledKernels:
@@ -169,6 +170,17 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
 
         self._validate_supported_shape(model)
         kernel_batch = model.runtime.max_batch_size
+
+        kernel_max_seq = int(getattr(qwen3_decode_layer, "MAX_SEQ", 4096))
+        if model.runtime.max_seq_len > kernel_max_seq:
+            raise ValueError(
+                f"max_model_len {model.runtime.max_seq_len} exceeds the kernel's "
+                f"compile-time MAX_SEQ {kernel_max_seq} (config.py). The decode/prefill "
+                "kernels precompute MAX_CTX_BLOCKS, NUM_PAGES, and rope table sizes from "
+                "MAX_SEQ; a larger runtime value silently produces wrong attention and "
+                "out-of-bounds rope reads. Rebuild the kernel with a larger MAX_SEQ."
+            )
+
         if int(qwen3_decode_layer.BATCH) != kernel_batch:
             raise ValueError(
                 "decode_layer.decode_fwd is compiled for a fixed kernel BATCH of "
@@ -638,14 +650,13 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
 
     @classmethod
     def _validate_total_kv_pages(cls, model: RuntimeModel, kernel_batch: int) -> None:
-        """Validate that runtime KV page count matches compiled capacity."""
+        """Validate that runtime KV page count covers the batch capacity."""
         if model.runtime.total_kv_pages is None:
             return
-        expected_pages = kernel_batch * (model.runtime.max_seq_len + model.runtime.page_size - 1) // model.runtime.page_size
-        if model.runtime.total_kv_pages != expected_pages:
+        if model.runtime.total_kv_pages < kernel_batch:
             raise ValueError(
-                "PyPTO Qwen3-14B kernels require total_kv_pages to match the runtime batch capacity: "
-                f"{model.runtime.total_kv_pages} provided, {expected_pages} required."
+                f"total_kv_pages must be at least kernel_batch ({kernel_batch}), "
+                f"got {model.runtime.total_kv_pages}"
             )
 
     @staticmethod

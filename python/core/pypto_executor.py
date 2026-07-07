@@ -53,14 +53,26 @@ class PyptoExecutor(ModelExecutor, ABC):
         self._runners: dict[str, ModelRunner] = {}
         self._compiled: dict[str, object] = {}
 
-    def register_model(self, model_id: str, record: ModelRecord) -> None:
-        """Compile kernels for ``record`` and attach a runner to ``model_id``."""
+    def register_model(self, model_id: str, record: ModelRecord) -> int:
+        """Compile kernels for ``record`` and attach a runner to ``model_id``.
+
+        Returns the number of KV cache pages allocated on the device so the
+        caller can synchronise host-side block metadata.
+        """
+        print("[register_model] compiling kernels …", flush=True)
         with profile_span("PyptoExecutor.register_model", cat="executor", args={"model_id": model_id}):
             compiled = self._compile_model(record.runtime_model)
-            self._compiled[model_id] = compiled
             runner = self._create_runner(model_id, compiled)
-            runner.init_kv_cache(model_id, record.config, record.runtime)
+            try:
+                num_pages = runner.init_kv_cache(model_id, record.config, record.runtime)
+            except Exception:
+                close = getattr(runner, "close", None)
+                if callable(close):
+                    close()
+                raise
+            self._compiled[model_id] = compiled
             self._runners[model_id] = runner
+        return num_pages
 
     def run_prefill(self, model: RuntimeModel, batch: PrefillBatch) -> PrefillResult:
         """Delegate prefill execution to the registered model runner."""

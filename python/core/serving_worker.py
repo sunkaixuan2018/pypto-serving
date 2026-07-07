@@ -55,7 +55,7 @@ class WorkerProcess:
         self.model_record = None
         self._page_size: int = 64
 
-    def init_device_and_model(self) -> None:
+    def init_device_and_model(self) -> int:
         from .model_loader import ModelLoader
         from .sampler import Sampler
         from .types import ModelRecord
@@ -109,9 +109,12 @@ class WorkerProcess:
 
             register_model = getattr(self.executor, "register_model", None)
             if callable(register_model):
-                register_model(self.config.model_id, self.model_record)
+                num_pages = register_model(self.config.model_id, self.model_record)
+            else:
+                raise RuntimeError("Executor has no register_model method")
 
             logger.info("Worker model loaded and ready")
+            return num_pages
 
     def _resolve_executor_cls(self):
         if self.config.executor_cls == "PyptoQwen14BExecutor":
@@ -370,14 +373,19 @@ def _worker_entry(
     input_queue: mp.Queue,
     output_queue: mp.Queue,
     ready_event,
+    num_pages_value,
 ):
     """Entry point for the worker subprocess."""
     import signal
     signal.signal(signal.SIGINT, signal.SIG_IGN)
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+    for _n in ("simpler_setup", "pypto", "simpler"):
+        logging.getLogger(_n).setLevel(logging.WARNING)
 
     worker = WorkerProcess(config, input_queue, output_queue)
     try:
-        worker.init_device_and_model()
+        num_pages = worker.init_device_and_model()
+        num_pages_value.value = num_pages
         ready_event.set()
         worker.busy_loop()
     except Exception as e:
@@ -385,17 +393,24 @@ def _worker_entry(
         ready_event.set()
 
 
-def spawn_worker(config: EngineConfig) -> tuple[mp.Process, mp.Queue, mp.Queue, mp.Event]:
-    """Spawn a worker process and return (process, input_queue, output_queue, ready_event)."""
+def spawn_worker(config: EngineConfig):
+    """Spawn a worker process and return (process, input_queue, output_queue, ready_event, num_pages_value).
+
+    ``num_pages_value`` is a shared ``multiprocessing.Value('i')`` that the
+    worker writes after ``init_device_and_model()`` completes.  The main
+    process reads it to synchronise the ``KvCacheManager`` block metadata with
+    the actual device-side KV cache size.
+    """
     ctx = mp.get_context("spawn")
     input_queue = ctx.Queue()
     output_queue = ctx.Queue()
     ready_event = ctx.Event()
+    num_pages_value = ctx.Value("i", 0)
 
     process = ctx.Process(
         target=_worker_entry,
-        args=(config, input_queue, output_queue, ready_event),
+        args=(config, input_queue, output_queue, ready_event, num_pages_value),
         daemon=False,
     )
     process.start()
-    return process, input_queue, output_queue, ready_event
+    return process, input_queue, output_queue, ready_event, num_pages_value

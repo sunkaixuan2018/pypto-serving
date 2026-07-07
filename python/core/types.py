@@ -58,10 +58,16 @@ class RuntimeConfig:
     page_size: int = 64
     max_batch_size: int = 1
     max_seq_len: int = 4096
+    # Host-side tensor placement.  NPU executors manage device memory through
+    # the DistributedWorker internally — keep this as ``"cpu"``.
     device: str = "cpu"
-    kv_dtype: str = "float32"
-    weight_dtype: str = "float32"
+    kv_dtype: str = "bfloat16"
+    weight_dtype: str = "bfloat16"
     total_kv_pages: int | None = None
+    # Fraction of total NPU HBM the server is allowed to use (weights + activations + KV).
+    npu_memory_utilization: float = 0.90
+    # Max tokens processed per scheduling step (chunked-prefill granularity).
+    max_num_batched_tokens: int = 4096
     # Compile-time generation limit used by model-specific runners.
     max_new_tokens: int = 256
 

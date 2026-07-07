@@ -70,15 +70,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="Data-parallel request routing policy.",
     )
     # Dtype
-    parser.add_argument("--dtype", default="float32", help="Weight data type (default: float32).")
+    parser.add_argument("--dtype", default="bfloat16", help="Weight data type (default: bfloat16).")
     parser.add_argument("--kv-cache-dtype", default="bfloat16", help="KV cache data type. 'auto' follows --dtype (default: bfloat16).")
 
     # Runtime
-    parser.add_argument("--max-model-len", type=int, default=512, help="Maximum sequence length (default: 512).")
+    parser.add_argument("--max-model-len", type=int, default=1024, help="Maximum sequence length (prompt + generated; default: 1024).")
     parser.add_argument("--block-size", type=int, default=128, help="KV cache block size (default: 128).")
+    parser.add_argument(
+        "--npu-memory-utilization",
+        type=float,
+        default=0.90,
+        help="Fraction of total NPU HBM the server is allowed to use "
+        "(weights + activations + KV cache). Default: 0.90.",
+    )
 
     # Generation
-    parser.add_argument("--max-new-tokens", type=int, default=32, help="Maximum new tokens to generate (default: 32).")
     parser.add_argument("--temperature", type=float, default=0.0, help="Sampling temperature (default: 0.0).")
     parser.add_argument("--top-p", type=float, default=1.0, help="Nucleus sampling probability (default: 1.0).")
     parser.add_argument("--top-k", type=int, default=None, help="Top-k sampling cutoff (default: disabled).")
@@ -165,7 +171,8 @@ def _build_runtime_config(args: argparse.Namespace):
         device="cpu",
         kv_dtype=kv_dtype,
         weight_dtype=args.dtype,
-        max_new_tokens=args.max_new_tokens,
+        npu_memory_utilization=args.npu_memory_utilization,
+        max_num_batched_tokens=args.max_num_batched_tokens,
     )
 
 
@@ -186,6 +193,10 @@ def run_serve(
     host: str = "0.0.0.0",
     port: int = 8000,
 ) -> None:
+    import logging
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+    for _n in ("simpler_setup", "pypto", "simpler"):
+        logging.getLogger(_n).setLevel(logging.WARNING)
     try:
         import uvicorn
     except ImportError as e:

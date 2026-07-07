@@ -9,12 +9,15 @@
 
 from __future__ import annotations
 
+import logging
 import time
 from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum, auto
 
 from .kv_cache import KvCacheManager
+
+logger = logging.getLogger(__name__)
 
 
 class RequestStatus(Enum):
@@ -128,8 +131,35 @@ class Scheduler:
         self.requests: dict[str, Request] = {}
 
     def add_request(self, request: Request) -> None:
-        if len(request.prompt_token_ids) > self.config.max_seq_len:
-            request.prompt_token_ids = request.prompt_token_ids[: self.config.max_seq_len]
+        prompt_len = len(request.prompt_token_ids)
+        max_seq_len = self.config.max_seq_len
+        if prompt_len > max_seq_len:
+            # vLLM-style: reject rather than silently truncate. A prompt that
+            # cannot fit max_seq_len can never be served, so failing loudly is
+            # safer than silently dropping the tail of the prompt.
+            raise ValueError(
+                f"Request {request.request_id} prompt length {prompt_len} "
+                f"exceeds max_seq_len {max_seq_len}; request rejected."
+            )
+        # Cap generation so prompt + generated tokens never exceed max_seq_len
+        # (vLLM-style: effective max_tokens = max_seq_len - prompt_len). This
+        # keeps every request within the KV-cache capacity budgeted per request
+        # and avoids overflow-driven preemption.
+        remaining = max_seq_len - prompt_len
+        if remaining <= 0:
+            raise ValueError(
+                f"Request {request.request_id} prompt length {prompt_len} "
+                f"leaves no room for generation within max_seq_len {max_seq_len}; "
+                f"request rejected."
+            )
+        if request.max_new_tokens > remaining:
+            logger.warning(
+                "Request %s: capping max_new_tokens %d -> %d to fit max_seq_len %d "
+                "(prompt_len=%d).",
+                request.request_id, request.max_new_tokens, remaining,
+                max_seq_len, prompt_len,
+            )
+            request.max_new_tokens = remaining
         if self.config.enable_prefix_cache:
             request.block_hashes = self.kv_cache_manager.compute_block_hashes(request.prompt_token_ids)
         request.status = RequestStatus.WAITING
@@ -240,8 +270,15 @@ class Scheduler:
             num_new = min(num_new, token_budget)
 
             if num_new <= 0:
-                remaining_waiting.append(request)
-                continue
+                # Full prefix-cache hit: leave 1 token for prefill so the
+                # output uses the SAME kernel as the cold run (prefill, not
+                # decode), producing identical first generated token.
+                if request.num_computed_tokens >= request.num_prompt_tokens:
+                    request.num_computed_tokens = max(0, request.num_prompt_tokens - 1)
+                    num_new = 1
+                else:
+                    remaining_waiting.append(request)
+                    continue
 
             num_blocks_needed = self._blocks_needed(request, num_new)
             if not self._try_allocate_blocks(request, num_blocks_needed):
