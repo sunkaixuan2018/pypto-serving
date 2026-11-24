@@ -9,9 +9,11 @@
 """Owner-local registration and transfer. Native completion is never inferred from HTTP."""
 
 import ctypes
+from dataclasses import asdict
 from functools import partial
 import importlib
 import logging
+import multiprocessing
 import os
 import select
 import socket
@@ -23,12 +25,14 @@ from typing import Protocol
 
 import msgspec
 
-from pypto_serving.tools.observe import span
+from pypto_serving.tools.observe import record, span
 from pypto_serving.tools.profile import configure_profiler, get_profiler
 from .config import PROVIDERS
 from .protocol import Copy, MAX_FRAME, decode
 
 logger = logging.getLogger(__name__)
+
+HIXL_SETUP_OPERATIONS = frozenset(("install", "connect_ranks", "prepare_link"))
 
 
 class TransferError(RuntimeError):
@@ -154,11 +158,21 @@ def provider_class(name):
     if name not in PROVIDERS:
         raise ValueError(f"unsupported transfer provider {name}")
     module, implementation = PROVIDERS[name]
-    return getattr(importlib.import_module(module), implementation)
+    provider = getattr(importlib.import_module(module), implementation)
+    return provider("rdma") if name == "hixl" else provider
 
 
-def provider_factory(name, hostname):
+def provider_factory(name, hostname, *, role=None, rank=0):
+    if name == "hixl":
+        return provider_class(name)(hostname, role, rank)
     return provider_class(name)(hostname)
+
+
+def host_copy(copy):
+    from simpler.transfer_domain import TransferCopy
+
+    return TransferCopy(copy.source_rank, copy.component, copy.source_offset,
+                        copy.destination_rank, copy.component, copy.destination_offset, copy.length)
 
 
 def _send(channel, value):
@@ -244,11 +258,11 @@ class Owner:
                     raise TransferError(f"owner completion unknown: {exc}", uncertain=True) from exc
                 raise
 
-    def ready(self):
+    def ready(self, expected_pid=None):
         self.child.close()
         pid = self.call("probe")
-        if pid == self.parent_pid:
-            raise RuntimeError("registration service is not an allocation owner")
+        if pid == self.parent_pid or (expected_pid is not None and pid != expected_pid):
+            raise RuntimeError("unexpected transfer process")
         self.pidfd = os.pidfd_open(pid)
         def observe():
             poller = select.poll()
@@ -273,15 +287,72 @@ class Owner:
             runtime.release_service_tensor(token)
         self.retained.clear()
 
-    def close(self):
+    def close(self, *, startup_failed=False):
         if self.retained:
             raise RuntimeError("cannot close registered owner")
-        self.call("stop")
+        if not startup_failed:
+            self.call("stop")
         self.monitor_stop.set()
         if self.monitor is not None:
             self.monitor.join(1)
             os.close(self.pidfd)
+            self.monitor = None
+        self.child.close()
         self.parent.close()
+
+
+class TransferWorker(Owner):
+    """Import an allocation owner's VMM lease into a separate transfer process."""
+
+    def __init__(self, boot, rank, hostname, role):
+        super().__init__(boot, rank, hostname, "hixl", partial(provider_factory, role=role, rank=rank))
+        self.process = None
+
+    def start(self, device_id):
+        self.process = multiprocessing.get_context("spawn").Process(
+            target=_serve_transfer, name=f"pd-transfer-{self.rank}",
+            args=(self.child, self.boot, self.rank, device_id, self.hostname,
+                  self.provider_factory, self.profile_config),
+        )
+        self.process.start()
+        self.ready(expected_pid=self.process.pid)
+
+    def register(self, runtime, tensor, name):
+        from simpler.buffer_export import BufferExportError
+
+        try:
+            exported = runtime.export_buffer(tensor, worker_id=self.rank)
+        except BufferExportError as exc:
+            self.retained.append((runtime, exc.exported))
+            raise
+        self.retained.append((runtime, exported))
+        region = decode(self.call("register", exported=asdict(exported),
+                                  name=name, extent=tensor.nbytes), Region)
+        record(logger, "vmm.registered", rank=self.rank, device=exported.device_id,
+               consumer_pid=self.process.pid, region=name, bytes=region.extent)
+        return region
+
+    def release(self):
+        self.call("release")
+        while self.retained:
+            runtime, exported = self.retained[0]
+            runtime.release_export(exported)
+            self.retained.pop(0)
+
+    def close(self, *, startup_failed=False):
+        super().close(startup_failed=startup_failed)
+        process = self.process
+        if process is None or process.pid is None:
+            return
+        process.join(10)
+        if process.is_alive() and startup_failed:
+            # Allocation exports are forbidden until startup has succeeded.
+            process.terminate()
+            process.join(5)
+        if process.is_alive() or (not startup_failed and process.exitcode != 0):
+            raise RuntimeError("transfer process did not retire normally")
+        process.close()
+        self.process = None
 
 
 def _owner_factory(owners, rank, context):
@@ -318,65 +389,30 @@ class OwnerService:
             self.thread.join(5)
             raise RuntimeError("owner transfer initialization failed") from self.start_error
 
+    def register(self, request):
+        token = request["token"]
+        address, extent = self.context.pin(token, _descriptor(request["descriptor"]))
+        self.tokens.append(token)
+        return address, extent
+
+    def release(self):
+        while self.tokens:
+            self.context.unpin(self.tokens[0])
+            self.tokens.pop(0)
+
+    @property
+    def retained(self):
+        return bool(self.tokens)
+
     def _run(self):
-        provider = None
-        sequence = 0
         try:
             if self.acl.aclrtSetCurrentContext(self.acl_context) != 0:
                 raise RuntimeError("cannot attach owner ACL context")
             os.environ["MC_TRANSFER_TIMEOUT"] = "30"
             provider = self.owner.provider_factory(self.owner.provider, self.owner.hostname)
             self.started.set()
-            while not self.stopped:
-                request = _receive(self.channel)
-                sequence += 1
-                if request["boot"] != self.owner.boot or request["sequence"] != sequence:
-                    raise ValueError("stale owner command")
-                reply = dict(boot=self.owner.boot, sequence=sequence)
-                try:
-                    op = request["operation"]
-                    if op == "probe":
-                        reply["result"] = os.getpid()
-                    elif op == "register":
-                        token = request["token"]
-                        address, extent = self.context.pin(token, _descriptor(request["descriptor"]))
-                        self.tokens.append(token)
-                        if extent != request["extent"]:
-                            raise ValueError("registered extent differs from allocation")
-                        reply["result"] = provider.register(self.owner.boot, self.owner.rank,
-                                                           request["name"], address, extent)
-                    elif op == "install":
-                        provider.install(tuple(decode(r, Region) for r in request["regions"]))
-                    elif op == "write":
-                        with span(logger, "pd.owner.decode", log=False, thread_cpu=True,
-                                  **request["observation"]):
-                            copies = tuple(decode(c, Copy) for c in request["copies"])
-                        with span(logger, "pd.native.write", cat="native-transfer",
-                                  **request["observation"], bytes=sum(c.length for c in copies),
-                                  segments=len(copies)):
-                            provider.write(request["peer"], copies)
-                    elif op == "release":
-                        provider.release()
-                        for token in self.tokens:
-                            self.context.unpin(token)
-                        self.tokens.clear()
-                    elif op == "profile":
-                        profiler = get_profiler(initially_active=False)
-                        if request["active"]:
-                            profiler.stop()
-                            profiler.start()
-                        else:
-                            profiler.stop()
-                    elif op == "stop":
-                        if self.tokens:
-                            raise RuntimeError("registered owner cannot stop")
-                        self.stopped = True
-                    else:
-                        raise ValueError("unknown owner operation")
-                except Exception as exc:
-                    reply.update(error=str(exc), uncertain=not isinstance(exc, ValueError)
-                                 and (not isinstance(exc, TransferError) or exc.uncertain))
-                _send(self.channel, reply)
+            _serve_owner(self.channel, self.owner.boot, self.owner.rank, self.owner.provider, provider, self)
+            self.stopped = True
         except Exception as exc:
             # Never unregister/unpin on a lost reply or uncertain native write.
             self.start_error = exc
@@ -384,9 +420,140 @@ class OwnerService:
             self.channel.close()
 
     def close(self):
-        if not self.stopped:
-            raise RuntimeError("owner must be safely retired before runtime shutdown")
         self.thread.join(5)
-        if self.thread.is_alive():
-            raise RuntimeError("owner progress thread still active")
+        if not self.stopped or self.thread.is_alive():
+            raise RuntimeError("owner must be safely retired before runtime shutdown")
         self.channel.close()
+
+
+class ImportedBuffers:
+    def __init__(self, device_id):
+        self.device_id = device_id
+        self.mappings = []
+
+    def register(self, request):
+        from simpler.buffer_export import BufferExport, BufferImportError, BufferMapping
+
+        exported = BufferExport(**request["exported"])
+        if exported.device_id != self.device_id:
+            raise ValueError("export belongs to a different device")
+        try:
+            mapping = BufferMapping(exported)
+        except BufferImportError as exc:
+            self.mappings.append(exc.mapping)
+            raise
+        self.mappings.append(mapping)
+        return mapping.base, mapping.descriptor.nbytes
+
+    def release(self):
+        while self.mappings:
+            try:
+                self.mappings[0].close()
+            except Exception:
+                # The provider has retired. Retry only the failed unmap.
+                try:
+                    self.mappings[0].close()
+                except Exception as exc:
+                    raise TransferError(f"buffer unmap incomplete: {exc}") from exc
+            self.mappings.pop(0)
+
+    @property
+    def retained(self):
+        return bool(self.mappings)
+
+
+def _serve_transfer(channel, boot, rank, device_id, hostname, factory, profile_config):
+    from pypto_serving.serving.utils.native_buffers import DeviceContext
+
+    # The compute owner and transfer consumer share a device.
+    os.environ["HCCL_NPU_SOCKET_PORT_RANGE"] = "auto"
+    os.environ["HCCL_HOST_SOCKET_PORT_RANGE"] = "auto"
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    buffers = ImportedBuffers(device_id)
+    try:
+        context = DeviceContext(device_id)
+        configure_profiler(profile_config, process_name=f"pd-transfer-{rank}", initially_active=False)
+        provider = factory("hixl", hostname)
+        _serve_owner(channel, boot, rank, "hixl", provider, buffers, bind=context.bind)
+        context.close()
+    except Exception:
+        channel.close()
+        if buffers.retained:
+            logger.exception("transfer process lost control; imported buffers remain retained")
+            # Do not unmap storage the remote peer could still be writing.
+            threading.Event().wait()
+        raise
+    finally:
+        channel.close()
+
+
+def _serve_owner(channel, boot, rank, provider_name, provider, buffers, *, bind=None):
+    hixl = provider_name == "hixl"
+    released = False
+    sequence = 0
+    while True:
+        request = _receive(channel)
+        sequence += 1
+        if request["boot"] != boot or request["sequence"] != sequence:
+            raise ValueError("stale owner command")
+        reply = dict(boot=boot, sequence=sequence)
+        stopped = False
+        try:
+            if bind is not None:
+                bind()
+            op = request["operation"]
+            if op == "probe":
+                reply["result"] = os.getpid()
+            elif op == "register":
+                address, extent = buffers.register(request)
+                if extent != request["extent"]:
+                    raise ValueError("registered extent differs from allocation")
+                reply["result"] = provider.register(boot, rank, request["name"], address, extent)
+            elif op == "install":
+                regions = tuple(decode(r, Region) for r in request["regions"])
+                if hixl:
+                    provider.install(regions, peer=tuple(request["peer"]))
+                else:
+                    provider.install(regions)
+            elif op == "prepare_link" and hixl:
+                provider.prepare()
+            elif op == "connect_ranks" and hixl:
+                provider.connect(tuple(request["peer"]), request["ranks"])
+            elif op == "close_peer" and hixl:
+                provider.close_peer(tuple(request["peer"]))
+            elif op == "write":
+                with span(logger, "pd.owner.decode", log=False, thread_cpu=True, **request["observation"]):
+                    copies = tuple(decode(c, Copy) for c in request["copies"])
+                with span(logger, "pd.native.write", cat="native-transfer",
+                          **request["observation"], bytes=sum(c.length for c in copies), segments=len(copies)):
+                    if hixl:
+                        provider.put_sync_host(tuple(request["peer"]), tuple(host_copy(copy) for copy in copies))
+                    else:
+                        provider.write(request["peer"], copies)
+                if hixl:
+                    record(logger, "hixl.batch_complete", **request["observation"],
+                           bytes=sum(c.length for c in copies), segments=len(copies))
+            elif op == "release":
+                if not released:
+                    if hixl:
+                        provider.close()
+                    else:
+                        provider.release()
+                    released = True
+                buffers.release()
+            elif op == "profile":
+                profiler = get_profiler(initially_active=False)
+                profiler.stop()
+                if request["active"]:
+                    profiler.start()
+            elif op == "stop":
+                if buffers.retained:
+                    raise RuntimeError("registered owner cannot stop")
+                stopped = True
+            else:
+                raise ValueError("unknown owner operation")
+        except Exception as exc:
+            reply.update(error=str(exc), uncertain=getattr(exc, "uncertain", not isinstance(exc, ValueError)))
+        _send(channel, reply)
+        if stopped:
+            return

@@ -167,6 +167,10 @@ class DSparkExtension:
     def worker_options(self):
         return self.transfer.worker_options()
 
+    def allocation_options(self, scope, name=None):
+        exported = scope == "cache" or (scope, name) == ("prefill_state", "hidden")
+        return {"exportable": True} if self.transfer.settings.use_vmm and exported else {}
+
     def worker_ready(self):
         self.transfer.worker_ready()
         # The base is otherwise lazy and can race with HIXL's first peer link.

@@ -6,13 +6,13 @@ PD is opt-in. Without `--pd-role`, Serving does not load PD or Mooncake, create 
 
 The initial adapter supports DeepSeek V4 Flash DSpark K7, greedy sampling, identical model weights and compatible cache formats on P and D. Use Serving's pinned PyPTO-Lib, which includes independent-head support from [Lib PR #1542](https://github.com/hw-native-sys/pypto-lib/pull/1542) and the matching checkpoint-publication ABI from [Lib PR #1707](https://github.com/hw-native-sys/pypto-lib/pull/1707).
 
-Use matching PyPTO/Simpler source builds with owner-local service and allocation-retain hooks; these hooks are not upstream APIs yet. PyPTO must expose `chip_service_factories`, `retain_service_tensor`, and `release_service_tensor`, backed by Simpler's owner-local allocation pinning. Its `RunConfig` must support explicit `backend_type` and `execution_mode` fields. These are required interfaces, not a fallback to an older runtime.
+Use matching PyPTO/Simpler source builds. PyPTO's `RunConfig` must support explicit `backend_type` and `execution_mode` fields. Mooncake and deployments with DDR offload require `chip_service_factories`, `retain_service_tensor`, and `release_service_tensor`, backed by Simpler's owner-local allocation pinning.
 
 Control protocol version 3 separates the common replicated-page data contract from each node's local rank groups. All participants must use the same protocol version; older schemas are rejected. Every destination cache replica selects a complete source replica from the request's Prefill partition. Page/ring formats must remain compatible: this is replica mapping, not a general sharded-layout conversion.
 
-Follow the SDK's normal source-build instructions with its matching runtime pin and required PTOAS version. The tested integration uses PTOAS 0.67. Keep runtime revision checks enabled; a binary copied from another checkout is not a matching source installation.
+Follow the SDK's normal source-build instructions with its matching runtime pin and required PTOAS version. Use the PTOAS release required by the PyPTO source checkout. Keep runtime revision checks enabled; a binary copied from another checkout is not a matching source installation.
 
-Model nodes require Linux Python with `os.pidfd_open` and a working Mooncake Ascend installation. Startup checks these dependencies before loading weights. Mooncake registers all regions inside their real allocation owners before the first transfer; adding regions after a peer connection is established is not supported. Transfers are device-to-device without Host staging. Deploy on a trusted network: internal control endpoints are not authenticated.
+Model nodes require Linux Python with `os.pidfd_open`. The Mooncake provider requires a working Mooncake Ascend installation. Startup checks these dependencies before loading weights. Mooncake registers all regions inside their real allocation owners before the first transfer; adding regions after a peer connection is established is not supported. Transfers are device-to-device without Host staging. Deploy on a trusted network: internal control endpoints are not authenticated.
 
 Install `python -m pip install -e '.[pd]'` in each environment. The Router only needs this extra, not PyPTO, model weights, or NPUs. Optional constrained tools use the ordinary [XGrammar deployment requirements](../models/deepseek-v4/tool-constraints.md).
 
@@ -101,7 +101,60 @@ curl -N http://127.0.0.1:8110/v1/chat/completions \
 
 Completion/chat, streaming, tools and optional constraints reuse Serving's ordinary API. Invalid preparation fails before SSE headers. Later execution failures emit an explicit stream error; clients must inspect events even after HTTP 200.
 
-HTTP, control (HTTP port + 10000 by default), and Mooncake's dynamic RPC/RoCE endpoints must be reachable. Optional entry fields are `control_port` and `transfer_hostname` for a distinct data-plane address. Optional fields in the top-level `pd` section are `provider` (currently `mooncake`), `policy` (currently `round_robin`), `capacity` (256 per node), `handoff_timeout` (300 seconds), `request_timeout` (3600 seconds), and `run_id`. Timeouts do not authorize reuse of possibly active memory.
+HTTP, control (HTTP port + 10000 by default), and the provider's RPC/RoCE endpoints must be reachable. Optional entry fields are `control_port` and `transfer_hostname` for a distinct transfer address. Optional fields in the top-level `pd` section are `provider` (default `mooncake`), `policy` (currently `round_robin`), `capacity` (256 per node), `handoff_timeout` (300 seconds), `request_timeout` (3600 seconds), and `run_id`. Timeouts do not authorize reuse of possibly active memory.
+
+### Experimental HIXL CS provider on A3
+
+Set `pd.provider` to `hixl` with one or more replicas in each role.
+With DDR offload disabled, this provider uses PyPTO's
+`alloc_tensor(exportable=True)`, `export_buffer`, and `release_export` APIs.
+Each rank's separate transfer process imports its VMM cache and registers the
+imported address with HIXL. Shutdown unregisters and unmaps the address before
+releasing the compute owner's export. With DDR offload enabled, the existing
+owner-local registration path is used while the DDR consumer uses local retains.
+Use matching Simpler and CANN 9.1.0 builds. Simpler's
+`examples/workers/l4/pd_rdma_probe/README.md` covers building the standalone
+`pd_rdma_probe` and the `libpd_rdma_bridge.so` bridge used by Serving.
+Set `PYPTO_HIXL_BRIDGE` to the bridge's absolute path and set
+`PYPTO_HIXL_DEVICE_IP` and `PYPTO_HIXL_PHYSICAL_DEVICE` to the local device's
+RoCE IPv4 address and physical ID on each node. Set `PYPTO_HIXL_PORT` on
+Decode. Its `transfer_hostname` (or `host` when omitted) supplies the
+management IPv4 address for HIXL CS. Use the private P/D network for the
+Serving control, HIXL listener, and probe bootstrap ports.
+
+For multiple devices, set `PYPTO_HIXL_DEVICE_ENDPOINTS` on each node to a JSON
+array of `[RoCE IPv4, physical device ID]` pairs in the same rank order as
+`--devices`. This replaces the two single-device endpoint variables. Each
+Decode rank listens on `PYPTO_HIXL_PORT + rank`. Assign disjoint HIXL port
+ranges to Decode replicas on the same host.
+
+The first authorized plan for a Decode rank starts its HIXL listener and
+registers its KV regions. Each configured Prefill may connect to the same
+listener and reuse those registrations. Prefill keeps a separate connection
+for each destination replica and rank, and verifies the remote addresses
+against that replica's Serving registry before writing.
+
+Decode reserves the destination pages per request. The worker uses the ranges
+in the authorized `Plan.copies` for one synchronous batch per source and
+destination rank pair. Decode commits the final chunk after all batches
+succeed and the completion matches that request's authorized plan. Stop
+the Prefill replicas first. Decode releases its registrations after every
+connected Prefill has acknowledged retirement. Keep replica identities stable
+for the duration of a deployment.
+
+The single-card probe uses real device allocations and the Serving plan,
+completion and cache-manager paths with synthetic KV. Run the roles in
+separate terminals. Start Decode first and wait for `DECODE_READY`, then
+start Prefill. Decode waits up to 90 seconds by default for the handoff.
+Each `--port` is used for probe bootstrap. Serving control uses that value
+plus 10000.
+
+```bash
+python examples/pd_rdma_probe.py --role decode --device "$D_DEVICE" \
+  --host "$D_HOST" --port 20882 --peer-host "$P_HOST" --peer-port 20881
+python examples/pd_rdma_probe.py --role prefill --device "$P_DEVICE" \
+  --host "$P_HOST" --port 20881 --peer-host "$D_HOST" --peer-port 20882
+```
 
 `handoff_timeout` bounds individual control, transfer, and stop-confirmation operations. Waiting for the full Prefill before Decode uses `request_timeout`, so a long, progressing Prefill is not mistaken for a stalled transfer. Non-streaming JSON response headers also wait under `request_timeout`, because they follow generation; streaming setup headers retain `handoff_timeout`. Expiry still follows the normal abort and lease-retirement rules.
 

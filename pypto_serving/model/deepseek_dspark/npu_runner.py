@@ -2632,12 +2632,14 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         worker = self._shared_l3_worker()
         worker_ids = tuple(range(self._compiled.layout.ranks))
         shards = []
+        allocation_options = getattr(self.runtime_extension, "allocation_options", None)
+        options = allocation_options(scope, name) if allocation_options is not None else {}
         try:
             for worker_id in worker_ids:
                 shards.append(
                     worker.alloc_tensor(
                         full_shape[1:], dtype, init=torch.full(full_shape[1:], init_value, dtype=dtype),
-                        worker_id=worker_id,
+                        worker_id=worker_id, **options,
                     )
                 )
         except Exception:
@@ -2663,14 +2665,17 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         self,
         full_shape: tuple[int, ...],
         dtype: torch.dtype,
+        *,
+        exportable: bool = False,
     ) -> StackedDeviceTensor:
         """Allocate an uninitialized shard directly on every chip worker."""
         worker = self._shared_l3_worker()
         worker_ids = tuple(range(self._compiled.layout.ranks))
         shards: list[Any] = []
+        options = {"exportable": True} if exportable else {}
         try:
             for worker_id in worker_ids:
-                shards.append(worker.alloc_tensor(full_shape[1:], dtype, worker_id=worker_id))
+                shards.append(worker.alloc_tensor(full_shape[1:], dtype, worker_id=worker_id, **options))
         except Exception:
             for shard, worker_id in zip(shards, worker_ids, strict=False):
                 worker.free_tensor(shard, worker_id=worker_id)
@@ -2758,9 +2763,11 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
             ),
         }
         cache = {}
+        allocation_options = getattr(self.runtime_extension, "allocation_options", None)
+        options = allocation_options("cache") if allocation_options is not None else {}
         try:
             for name, (shape, dtype) in shapes.items():
-                cache[name] = self._alloc_empty_stacked_tensor(shape, dtype)
+                cache[name] = self._alloc_empty_stacked_tensor(shape, dtype, **options)
         except Exception:
             for tensor in cache.values():
                 self._l3_worker.free_stacked_tensor(tensor)

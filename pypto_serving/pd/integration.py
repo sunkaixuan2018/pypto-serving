@@ -193,7 +193,7 @@ class Server(ServingServer):
 
 
 class Application:
-    def __init__(self, engine_config, config, role, endpoint, tokenizer, generate):
+    def __init__(self, engine_config, config, role, endpoint, tokenizer, generate, *, use_vmm):
         self.boot = uuid.uuid4().hex
         self.adapter = select_adapter(engine_config.executor_cls)
         if engine_config.runtime_config.num_speculative_tokens != 7:
@@ -206,7 +206,7 @@ class Application:
         self.channel, self.progress = channel, progress
         settings = WorkerSettings(self.boot, endpoint.transfer_hostname or endpoint.host,
                                   config.provider, config.capacity, len(config.prefill) + len(config.decode),
-                                  config.handoff_timeout)
+                                  config.handoff_timeout, role=role, use_vmm=use_vmm)
         tokens = 0 if role == "prefill" else 7
         engine_config = replace(engine_config,
             runtime_config=replace(engine_config.runtime_config, num_speculative_tokens=tokens),
@@ -292,11 +292,17 @@ def run(args, engine_config, generate):
     config = Config.load(args.pd_config)
     if not hasattr(os, "pidfd_open"):
         raise ValueError("PD model nodes require Linux Python with os.pidfd_open")
-    from pypto.runtime.distributed_runner import DistributedWorker
-    if ("chip_service_factories" not in signature(DistributedWorker).parameters
-            or not all(hasattr(DistributedWorker, name)
-                       for name in ("retain_service_tensor", "release_service_tensor"))):
-        raise ValueError("PyPTO lacks the required owner-service and tensor-retain interfaces")
+    # The existing DDR consumer uses chip-local retains until it migrates to VMM.
+    use_vmm = config.provider == "hixl" and not engine_config.runtime_config.kv_offload_bytes
+    if use_vmm:
+        from pypto_serving.serving.utils.native_buffers import check_buffer_exports
+        check_buffer_exports()
+    else:
+        from pypto.runtime.distributed_runner import DistributedWorker
+        if ("chip_service_factories" not in signature(DistributedWorker).parameters
+                or not all(hasattr(DistributedWorker, name)
+                           for name in ("retain_service_tensor", "release_service_tensor"))):
+            raise ValueError("PyPTO lacks the required owner-service and tensor-retain interfaces")
     provider_class(config.provider).check_available()
     logging.basicConfig(level=logging.INFO)
     configure_runtime_logging()
@@ -305,5 +311,5 @@ def run(args, engine_config, generate):
     if args.port != endpoint.port:
         raise ValueError("HTTP --port must equal this node's configured port")
     application = Application(engine_config, config, args.pd_role, endpoint,
-                              load_tokenizer(engine_config.model_dir), generate)
+                              load_tokenizer(engine_config.model_dir), generate, use_vmm=use_vmm)
     uvicorn.run(application.app, host=args.host, port=args.port)
