@@ -71,7 +71,7 @@ class Request:
 
 
 class Service:
-    def __init__(self, config, endpoint, role, adapter, core, progress):
+    def __init__(self, config, endpoint, role, adapter, core, progress, *, mpi_control=None):
         self.config, self.endpoint, self.role = config, endpoint, role
         self.adapter, self.core, self.progress = adapter, core, progress
         self.cache = core.kv_cache_manager
@@ -91,6 +91,7 @@ class Service:
         self.hixl_senders = {}
         self.hixl_retired = set()
         self.hixl_open = {}
+        self.mpi_control = mpi_control
 
     async def worker(self, operation, value=None):
         hixl_setup = operation in HIXL_SETUP_OPERATIONS and self.config.provider == "hixl"
@@ -135,17 +136,30 @@ class Service:
         topology = decode(self.registry["topology"], Topology)
         self.node = Node(self.endpoint.node_id, self.role, boot, contract, digest(self.registry),
                          topology, self.config.provider, self.cache.enable_prefix_cache)
-        if self.role == "decode":
-            self.listener = await asyncio.start_server(self._accept, "0.0.0.0", self.endpoint.control_port)
-        elif self.config.provider == "hixl":
-            from simpler.worker import Worker
-            self.hixl_control = Worker(level=4)
-            self.hixl_control.init()
+        try:
+            if self.role == "decode":
+                address = (self.mpi_control.bind_address if self.mpi_control is not None
+                           else ("0.0.0.0", self.endpoint.control_port))
+                self.listener = await asyncio.start_server(self._accept, *address)
+            elif self.config.provider == "hixl":
+                from simpler.worker import Worker
+                self.hixl_control = Worker(level=4)
+                self.hixl_control.init()
+            if self.mpi_control is not None:
+                await self.mpi_control.start(self.node)
+        except BaseException:
+            if self.listener is not None:
+                self.listener.close()
+                await self.listener.wait_closed()
+            if self.hixl_control is not None:
+                self.hixl_control.close()
+            raise
         logger.info("ready node=%s role=%s boot=%s prefix=%s", self.node.node_id, self.role,
                     boot, self.node.prefix)
 
     def is_ready(self):
         return (self.node is not None and not self.gated and not self.closing
+                and (self.mpi_control is None or self.mpi_control.ready)
                 and self.core.is_ready())
 
     def status(self, request):
@@ -282,7 +296,9 @@ class Service:
 
     async def _connect_peer(self, node):
         endpoint = self.config.endpoint("decode", node.node_id)
-        reader, writer = await asyncio.open_connection(endpoint.host, endpoint.control_port)
+        address = (self.mpi_control.connect_address(node.node_id) if self.mpi_control is not None
+                   else (endpoint.host, endpoint.control_port))
+        reader, writer = await asyncio.open_connection(*address)
         try:
             await send(writer, dict(node=self.node, registry=self.registry))
             hello = await receive(reader)
