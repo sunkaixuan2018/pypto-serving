@@ -9,10 +9,8 @@
 
 """Replica table, host pool, and router settings.
 
-Two kinds of replica appear here. Entries under ``replicas`` already exist: the
-router routes to them and never stops them. Entries under ``hosts`` describe
-capacity the router may *launch* into -- one slot per declared device -- and a
-replica launched from a slot is owned by the router and stopped with it.
+``replicas`` describes HTTP endpoints. ``hosts`` supplies launch slots for
+ordinary replicas. ``mpi_pd`` supplies launch settings for P/D endpoints.
 """
 
 from __future__ import annotations
@@ -20,6 +18,10 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .mpi_config import MPIDeployment
 
 # A replica whose pinned load exceeds the least-loaded one by more than this many
 # outstanding requests loses the pin. Affinity saves at most one prefill;
@@ -210,6 +212,7 @@ class RouterConfig:
     replace_after_seconds: float = DEFAULT_REPLACE_AFTER_SECONDS
     pd_options: dict | None = None
     observability: dict | None = None
+    mpi_pd: MPIDeployment | None = None
 
     @property
     def is_pd(self) -> bool:
@@ -220,11 +223,11 @@ class RouterConfig:
             raise ValueError("router requires at least one replica or one host")
         if self.is_pd:
             if {r.role for r in self.replicas} != {"prefill", "decode"} or self.hosts:
-                raise ValueError("PD requires static prefill/decode pools without ordinary replicas or hosts")
+                raise ValueError("PD requires prefill/decode pools without ordinary replicas or hosts")
             addresses = [(r.host, r.port) for r in self.replicas]
             if len(set(addresses)) != len(addresses):
                 raise ValueError("PD replica HTTP endpoints must be unique")
-        elif self.pd_options is not None or self.observability is not None:
+        elif self.pd_options is not None or self.observability is not None or self.mpi_pd is not None:
             raise ValueError("PD options require prefill/decode replicas")
         names = [replica.name for replica in self.replicas]
         if len(set(names)) != len(names):
@@ -443,10 +446,14 @@ def load_router_config(path: str | Path, **settings) -> RouterConfig:
         raise ValueError(f"cannot read replica file {file_path}: {exc}") from exc
     except json.JSONDecodeError as exc:
         raise ValueError(f"replica file {file_path} is not valid JSON: {exc.msg}") from exc
-    if not isinstance(data, dict):
-        raise ValueError(f"replica file {file_path} must be a JSON object")
+    return parse_router_config(data, **settings)
 
-    unknown = sorted(set(data) - {"replicas", "hosts", "pd", "observability"})
+
+def parse_router_config(data: object, **settings) -> RouterConfig:
+    if not isinstance(data, dict):
+        raise ValueError("replica configuration must be a JSON object")
+
+    unknown = sorted(set(data) - {"replicas", "hosts", "pd", "observability", "mpi_pd"})
     if unknown:
         raise ValueError(f"replica file has unknown top-level keys: {', '.join(unknown)}")
 
@@ -456,7 +463,7 @@ def load_router_config(path: str | Path, **settings) -> RouterConfig:
         raise ValueError("'replicas' and 'hosts' must be lists")
     if not raw_replicas and not raw_hosts:
         raise ValueError(
-            f"replica file {file_path} declares neither a replica nor a launchable host"
+            "replica configuration declares neither a replica nor a launchable host"
         )
 
     replicas = tuple(_parse_replica(entry, i) for i, entry in enumerate(raw_replicas))
@@ -473,8 +480,13 @@ def load_router_config(path: str | Path, **settings) -> RouterConfig:
             raise ValueError("PD replicas do not support " + ", ".join(unsupported))
     if settings.get("initial_replicas") is None:
         settings["initial_replicas"] = int(bool(hosts))
+    deployment = None
+    if "mpi_pd" in data:
+        from .mpi_config import MPIDeployment
+
+        deployment = MPIDeployment.parse(data["mpi_pd"], replicas)
     return RouterConfig(replicas=replicas, hosts=hosts, pd_options=data.get("pd"),
-                        observability=data.get("observability"), **settings)
+                        observability=data.get("observability"), mpi_pd=deployment, **settings)
 
 
 def load_fleet_file(path: str | Path) -> tuple[tuple[ReplicaSpec, ...], tuple[HostSpec, ...]]:

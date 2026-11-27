@@ -164,6 +164,13 @@ class PeerPool:
                 if not entry.users:
                     await self._remove(key, entry)
 
+    async def wait_pending(self, timeout):
+        tasks = [entry.value for entry in self.entries.values() if not entry.value.done()]
+        if tasks:
+            _, pending = await asyncio.wait(tasks, timeout=timeout)
+            if pending:
+                raise RuntimeError("peer session setup is still active; resource retirement unconfirmed")
+
     async def close(self):
         if any(e.users for e in self.entries.values()):
             raise RuntimeError("cannot close sessions with active handoffs")

@@ -11,7 +11,9 @@
 from dataclasses import dataclass, field
 from datetime import datetime
 from contextlib import contextmanager
+import json
 import logging
+import os
 from pathlib import Path
 import uuid
 
@@ -91,8 +93,14 @@ class Config:
 
     @classmethod
     def load(cls, path):
-        from pypto_serving.router.config import load_router_config
+        from pypto_serving.router.config import load_router_config, parse_router_config
+        from pypto_serving.router.mpi_config import PD_CONFIG_ARG, PD_CONFIG_ENV
 
+        if path == PD_CONFIG_ARG:
+            snapshot = os.environ.get(PD_CONFIG_ENV)
+            if not snapshot or not os.environ.get("SIMPLER_MPI_DIRECT_INSTANCE_ID"):
+                raise ValueError("MPI PD deployment configuration was not supplied by the service rank")
+            return cls.from_router(parse_router_config(json.loads(snapshot)))
         return cls.from_router(load_router_config(path))
 
     @classmethod

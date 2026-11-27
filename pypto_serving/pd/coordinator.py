@@ -33,9 +33,10 @@ _STREAM = TypeAdapter(bool)
 class PDCoordinator:
     """Coordinate a request; the common router owns HTTP and node liveness."""
 
-    def __init__(self, config, registry, client, probe_client):
+    def __init__(self, config, registry, client, probe_client, *, mpi=None):
         self.config, self.registry, self.client = config, registry, client
         self.probe_client = probe_client
+        self.mpi = mpi
         self.nodes = {}
         self.models, self.discovered = set(), set()
         self.policy = RoundRobin()
@@ -50,7 +51,17 @@ class PDCoordinator:
             values = {k: min(v, read) if v is not None else read for k, v in values.items()}
         return httpx.Timeout(**{**values, "read": read})
 
+    def withdraw(self, name):
+        self.nodes.pop(name, None)
+        self.registry.set_ready(name, False)
+        if self.mpi is not None:
+            self.discovered.discard(name)
+            self.mpi.forget_descriptor(name)
+
     async def probe(self, spec):
+        if self.mpi is not None and not self.mpi.expects_descriptor(spec.name):
+            self.withdraw(spec.name)
+            return False
         try:
             response = await self.probe_client.get(spec.base_url + "/internal/pd/descriptor",
                                              timeout=self._timeout(5, control=True))
@@ -60,19 +71,21 @@ class PDCoordinator:
                     or node.provider != self.config.provider or node.version != VERSION
                     or not node.contract.model):
                 raise ValueError("descriptor differs from configured PD node")
+            if self.mpi is not None and not self.mpi.matches_descriptor(node):
+                raise ValueError("descriptor differs from the rank-0 readiness identity")
+            if self.mpi is not None and node.healthy:
+                self.mpi.confirm_descriptor(spec.name)
             self.models.add(node.contract.model)
             self.discovered.add(spec.name)
             if not node.healthy:
-                self.nodes.pop(spec.name, None)
-                self.registry.set_ready(spec.name, False)
+                self.withdraw(spec.name)
                 return False
             self.nodes[spec.name] = node
             return True
         except httpx.PoolTimeout:
             raise  # The shared HealthMonitor classifies local pool pressure.
         except (httpx.HTTPError, ValueError):
-            self.nodes.pop(spec.name, None)
-            self.registry.set_ready(spec.name, False)
+            self.withdraw(spec.name)
             return False
 
     def _candidates(self, model):
@@ -82,6 +95,8 @@ class PDCoordinator:
             valid = (p is not None and d is not None and p.compatible(d)
                      and p.role == "prefill" and d.role == "decode"
                      and all(self.registry.state(n).routable for n in (p_id, d_id))
+                     and (self.mpi is None or (self.mpi.allows_pair(p_id, d_id)
+                                               and all(self.mpi.matches_descriptor(n) for n in (p, d))))
                      and (model is None or p.contract.model == model))
             result.append((p, d) if valid else None)
         return result
@@ -94,6 +109,8 @@ class PDCoordinator:
         model = payload.get("model")
         if model is not None and not isinstance(model, str):
             raise ValueError("model must be a string")
+        if self.closing:
+            raise RouterError(503, "router_closing", "Router is closing")
         candidates = self._candidates(model or None)
         if not any(candidates):
             if model and model not in self.models and len(self.discovered) == len(self.registry.states):
@@ -118,6 +135,17 @@ class PDCoordinator:
     async def close(self):
         self.closing = True
         await close_requests(self.active, self.config.handoff_timeout)
+
+    async def drain(self, timeout):
+        deadline = asyncio.get_running_loop().time() + timeout
+        while True:
+            # Prefill releases its own counter as soon as it returns. Decode
+            # retains one count per admitted request through HTTP retirement.
+            remaining = sum(state.outstanding for state in self.registry.states if state.spec.role == "decode")
+            delay = deadline - asyncio.get_running_loop().time()
+            if not remaining or delay <= 0:
+                return remaining
+            await asyncio.sleep(min(0.05, delay))
 
     async def forward(self, request: Request, path: str):
         owner = asyncio.current_task()

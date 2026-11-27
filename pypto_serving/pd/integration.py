@@ -30,6 +30,7 @@ from pypto_serving.serving.server.server import ChatCompletionRequest, Completio
 from pypto_serving.serving.server.serving_worker import spawn_worker
 from .adapter import select_adapter
 from .config import Config, log_context
+from .mpi_control import MPIServiceControl, MPISettings
 from .protocol import Binding, CapacityExhausted, Continuation, Node, decode
 from .service import ExecutionError, NodeUnavailable, Service
 from .worker import Progress, Services, WorkerSettings
@@ -193,8 +194,9 @@ class Server(ServingServer):
 
 
 class Application:
-    def __init__(self, engine_config, config, role, endpoint, tokenizer, generate, *, use_vmm):
+    def __init__(self, engine_config, config, role, endpoint, tokenizer, generate, *, use_vmm, mpi_control=None):
         self.boot = uuid.uuid4().hex
+        self.shutdown_completed = False
         self.adapter = select_adapter(engine_config.executor_cls)
         if engine_config.runtime_config.num_speculative_tokens != 7:
             raise ValueError("PD deployment requires the K7 model configuration")
@@ -221,7 +223,8 @@ class Application:
             scheduler_factory=prefill_scheduler if role == "prefill" else Scheduler,
             worker_factory=partial(spawn_worker, services_factory=Services)))
         self.core = self.engine.single_core()
-        self.service = Service(config, endpoint, role, self.adapter, self.core, progress)
+        self.service = Service(config, endpoint, role, self.adapter, self.core, progress,
+                               mpi_control=mpi_control)
         if role == "prefill":
             self.core.publish = self.wrap_results()
         self.server = Server(self.service, self.engine, generate)
@@ -269,15 +272,28 @@ class Application:
         await self.engine.start()
         if self.channel is not None:
             self.channel.close()
-        await self.service.start(self.boot, self.core.config.model_id)
+        try:
+            await self.service.start(self.boot, self.core.config.model_id)
+        except BaseException:
+            if self.service.mpi_control is not None:
+                await self.engine.stop()
+                if self.progress is not None:
+                    await self.progress.close()
+                self.logs.__exit__(None, None, None)
+            raise
 
     async def stop(self):
         # Unsafe retirement raises before registered allocations can be freed.
-        await self.service.close()
-        await self.engine.stop()
-        if self.progress is not None:
-            await self.progress.close()
-        self.logs.__exit__(None, None, None)
+        try:
+            await self.service.close()
+            await self.engine.stop()
+            if self.progress is not None:
+                await self.progress.close()
+            self.shutdown_completed = True
+        finally:
+            if self.service.mpi_control is not None:
+                await self.service.mpi_control.close()
+            self.logs.__exit__(None, None, None)
 
 
 def run(args, engine_config, generate):
@@ -310,6 +326,24 @@ def run(args, engine_config, generate):
     endpoint = config.endpoint(args.pd_role, args.pd_node_id)
     if args.port != endpoint.port:
         raise ValueError("HTTP --port must equal this node's configured port")
+    mpi_settings = MPISettings.from_environment(
+        os.environ, node_id=endpoint.node_id, role=args.pd_role,
+        decode_ids=(node.node_id for node in config.decode), provider=config.provider,
+    )
+    if mpi_settings is not None:
+        def request_shutdown():
+            http_server.should_exit = True
+
+        mpi_control = MPIServiceControl(mpi_settings, config.handoff_timeout, request_shutdown)
+    else:
+        mpi_control = None
     application = Application(engine_config, config, args.pd_role, endpoint,
-                              load_tokenizer(engine_config.model_dir), generate, use_vmm=use_vmm)
-    uvicorn.run(application.app, host=args.host, port=args.port)
+                              load_tokenizer(engine_config.model_dir), generate, use_vmm=use_vmm,
+                              mpi_control=mpi_control)
+    if mpi_control is None:
+        uvicorn.run(application.app, host=args.host, port=args.port)
+    else:
+        http_server = uvicorn.Server(uvicorn.Config(application.app, host=args.host, port=args.port))
+        http_server.run()
+        if mpi_settings.coordinated and not application.shutdown_completed:
+            raise RuntimeError("Serving shutdown could not confirm resource retirement")
