@@ -22,6 +22,9 @@ from dataclasses import replace
 import logging
 import os
 import secrets
+import signal
+import sys
+import threading
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Callable
@@ -109,13 +112,27 @@ class ServingRouter:
         self.sessions = SessionDirectory(config.session_ttl_seconds)
         self.registry = ReplicaRegistry(config, self.sessions)
         pd_config = None
+        self.mpi_job = None
+        self.http_shutdown_completed = False
         if config.is_pd:
             from pypto_serving.pd.config import Config
             from pypto_serving.pd.coordinator import PDCoordinator
 
             pd_config = Config.from_router(config)
             if state_path is not None:
-                raise ValueError("PD replicas are externally managed; --state-file requires ordinary hosts")
+                raise ValueError("--state-file requires ordinary replica hosts")
+            if config.mpi_pd is not None:
+                withdraw = lambda name: self.proxy.withdraw(name)
+                probe = lambda: self.health.wake()
+                if config.mpi_pd.owner == "supervisor":
+                    from pypto_serving.router.mpi_subscription import MPISubscription
+
+                    self.mpi_job = MPISubscription(config.mpi_pd, withdraw, probe, lambda t: self.proxy.drain(t))
+                else:
+                    from pypto_serving.router.mpi_job import MPIJob
+
+                    manifest = config.mpi_pd.manifest(config, pd_config)
+                    self.mpi_job = MPIJob(config.mpi_pd, manifest, withdraw, probe)
         client_config = (replace(config, max_connections=pd_config.http_connections,
                                  max_keepalive_connections=min(config.max_keepalive_connections,
                                                                pd_config.http_connections))
@@ -128,7 +145,8 @@ class ServingRouter:
         # congestion indistinguishable from a dead backend, for every replica
         # at once, because the pool is what they have in common.
         self.probe_client = client_factory(config)
-        self.proxy = (PDCoordinator(pd_config, self.registry, self.client, self.probe_client) if config.is_pd
+        self.proxy = (PDCoordinator(pd_config, self.registry, self.client, self.probe_client, mpi=self.mpi_job)
+                      if config.is_pd
                       else ReplicaProxy(self.registry, self.client, config.connect_timeout_seconds))
         self.health = HealthMonitor(config, self.registry, self.sessions, self.probe_client,
                                     probe=self.proxy.probe if config.is_pd else None)
@@ -170,20 +188,16 @@ class ServingRouter:
 
     @contextlib.asynccontextmanager
     async def _lifespan(self, _app: FastAPI):
-        """Run the health poller, and own the replicas we launch.
-
-        The shutdown half only runs on an orderly exit (SIGTERM/SIGINT through
-        uvicorn). A crash never reaches it, which is exactly the intent: a
-        replica that survives a router crash is minutes of model load saved,
-        and the next run adopts it.
-        """
+        """Run the health poller and manage the services this Router launches."""
         with contextlib.ExitStack() as stack:
             if self.config.is_pd:
                 from pypto_serving.pd.config import log_context
 
                 stack.enter_context(log_context(self.proxy.config, "router"))
             try:
-                await self.health.start(probe_first=self.config.is_pd)
+                if self.mpi_job is not None:
+                    await self.mpi_job.start()
+                await self.health.start(probe_first=self.config.is_pd and self.mpi_job is None)
                 if not self.config.is_pd:
                     await self.fleet.adopt_previous()
                     await self.fleet.launch_initial()
@@ -194,11 +208,16 @@ class ServingRouter:
                         await self.fleet.stop_all()
                     await self.proxy.close()
                 finally:
-                    await self.health.stop()
-                    for client in (self.client, self.probe_client):
-                        close = getattr(client, "aclose", None)
-                        if close is not None:
-                            await close()
+                    try:
+                        await self.health.stop()
+                        if self.mpi_job is not None:
+                            await self.mpi_job.stop()
+                    finally:
+                        for client in (self.client, self.probe_client):
+                            close = getattr(client, "aclose", None)
+                            if close is not None:
+                                await close()
+                self.http_shutdown_completed = True
 
     async def _health_status(self, spec) -> int | None:
         """The replica's /health status, or None if nothing answered.
@@ -335,6 +354,10 @@ class ServingRouter:
                 status_code=404,
                 content={"object": "error", "message": f"no replica named {name!r}"},
             )
+        if self.mpi_job is not None:
+            return JSONResponse(status_code=409, content={
+                "object": "error", "message": f"replica {name!r} is managed as part of the MPI job",
+            })
         if not state.owned:
             return JSONResponse(
                 status_code=409,
@@ -393,6 +416,8 @@ class ServingRouter:
                 "outstanding": sum(s.outstanding for s in self.registry.states if s.spec.role == role),
                 "routed": sum(s.routed for s in self.registry.states if s.spec.role == role),
             } for role in ("prefill", "decode")}
+        if self.mpi_job is not None:
+            payload["mpi_pd"] = self.mpi_job.status()
         return JSONResponse(payload, status_code=200 if available else 503)
 
     async def _list_models(self) -> JSONResponse:
@@ -454,8 +479,9 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--replicas", required=True, metavar="PATH",
-                        help='JSON file describing existing replicas and/or launchable hosts: '
-                             '{"replicas": [...], "hosts": [...]}.')
+                        help="JSON file with replica endpoints, an optional hosts pool, or an mpi_pd deployment.")
+    parser.add_argument("--supervise-mpi", action="store_true",
+                        help="Start a Supervisor-owned MPI deployment and its independent Router process.")
     parser.add_argument("--initial-replicas", type=int, default=None,
                         help="Replicas to launch from the host pool at startup. Defaults to 1 "
                              "when the file declares hosts, 0 when it does not.")
@@ -508,7 +534,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    args = build_parser().parse_args(arguments)
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
     try:
         # Launching one replica is the useful default, but only where there is
@@ -527,7 +554,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             }.items() if value is not None},
         )
         if config.is_pd and args.state_file is not None:
-            raise ValueError("PD replicas are externally managed; --state-file is not applicable")
+            raise ValueError("--state-file requires ordinary replica hosts")
+        if config.mpi_pd is not None:
+            config.mpi_pd.validate_http_bind(args.port)
+        if args.supervise_mpi:
+            from pypto_serving.router.mpi_job import launch_supervisor
+
+            return launch_supervisor(config, [arg for arg in arguments if arg != "--supervise-mpi"])
     except ValueError as exc:
         print(f"error: {exc}")
         return 1
@@ -553,8 +586,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise ImportError("The router requires uvicorn. Install with: pip install uvicorn") from e
 
     print(f"Starting PyPTO serving router on {args.host}:{args.port}")
+    owner = config.mpi_pd.owner + "-managed MPI job" if config.mpi_pd is not None else "external"
     for replica in config.replicas:
-        print(f"  Replica ({replica.role}, external): {replica.name} -> {replica.base_url}")
+        print(f"  Replica ({replica.role}, {owner}): {replica.name} -> {replica.base_url}")
     for host in config.hosts:
         where = "local" if host.is_local else host.ssh
         print(
@@ -563,7 +597,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     print(f"  Pool: launching {config.initial_replicas} of {config.pool_ceiling} slot(s) at startup")
     if config.is_pd:
-        print("  Routing: round-robin compatible P/D pairs; nodes are managed externally")
+        print(f"  Routing: round-robin compatible P/D pairs ({owner})")
     else:
         print(f"  Session TTL: {config.session_ttl_seconds:g}s, affinity slack: {config.affinity_slack}")
     print("  Endpoints: /v1/completions, /v1/chat/completions, /v1/models, /health, /replicas")
@@ -581,8 +615,22 @@ def main(argv: Sequence[str] | None = None) -> int:
     except ValueError as exc:
         print(f"error: {exc}")
         return 1
-    uvicorn.run(app, host=args.host, port=args.port, log_level="info")
-    return 0
+    options = {}
+    if config.mpi_pd is not None:
+        options["timeout_graceful_shutdown"] = config.mpi_pd.drain_timeout_s
+    # Uvicorn may replay SIGTERM after its graceful shutdown. Keep the
+    # independent Router alive long enough to return the lifecycle result.
+    managed = config.mpi_pd is not None and config.mpi_pd.owner == "supervisor"
+    with contextlib.ExitStack() as signals:
+        if (managed and threading.current_thread() is threading.main_thread()
+                and signal.getsignal(signal.SIGTERM) == signal.SIG_DFL):
+            previous = signal.signal(signal.SIGTERM, lambda *_: None)
+            signals.callback(signal.signal, signal.SIGTERM, previous)
+        uvicorn.run(app, host=args.host, port=args.port, log_level="info", **options)
+    if managed and not app.state.router.http_shutdown_completed:
+        return 1
+    job = app.state.router.mpi_job
+    return int(getattr(job, "error", None) is not None)
 
 
 __all__ = ["SESSION_HEADER", "ServingRouter", "build_parser", "create_router_app", "main"]

@@ -378,6 +378,10 @@ class HealthMonitor:
         self._client = client
         self._probe_callback = probe
         self._task: asyncio.Task | None = None
+        self._wakeup = asyncio.Event()
+
+    def wake(self) -> None:
+        self._wakeup.set()
 
     async def start(self, *, probe_first: bool = False) -> None:
         if self._task is None:
@@ -397,6 +401,7 @@ class HealthMonitor:
         if delay_first:
             await asyncio.sleep(self._config.health_interval_seconds)
         while True:
+            self._wakeup.clear()
             try:
                 await self.probe_once()
                 self._sessions.sweep()
@@ -404,7 +409,8 @@ class HealthMonitor:
                 raise
             except Exception:  # noqa: BLE001 - the poller must outlive one bad cycle
                 logger.exception("health poll cycle failed")
-            await asyncio.sleep(self._config.health_interval_seconds)
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(self._wakeup.wait(), self._config.health_interval_seconds)
 
     async def probe_once(self) -> None:
         await asyncio.gather(

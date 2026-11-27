@@ -87,7 +87,7 @@ It independently receives the current request's rolling KV, final state and
 bootstrap data, including when all complete history is shared. P and D hits
 need not agree; the Router does not query or manage physical cache.
 
-The common Serving Router uses `role: "prefill"` and `role: "decode"` in its `replicas` table. Entries without a role remain ordinary complete replicas. PD requires both roles and uses statically launched nodes; mixing complete replicas, PD nodes or launchable `hosts` is rejected. The Router never starts or stops these external P/D processes.
+The common Serving Router uses `role: "prefill"` and `role: "decode"` in its `replicas` table. Entries without a role remain ordinary complete replicas. PD requires both roles in its own Router. The command below routes to independently started P/D processes. To have the Router start them, add the MPI deployment configuration described in [Launch P/D with MPI Direct](#launch-pd-with-mpi-direct).
 
 Start the external Router, then wait for `/health` to report `ok`:
 
@@ -102,6 +102,125 @@ curl -N http://127.0.0.1:8110/v1/chat/completions \
 Completion/chat, streaming, tools and optional constraints reuse Serving's ordinary API. Invalid preparation fails before SSE headers. Later execution failures emit an explicit stream error; clients must inspect events even after HTTP 200.
 
 HTTP, control (HTTP port + 10000 by default), and the provider's RPC/RoCE endpoints must be reachable. Optional entry fields are `control_port` and `transfer_hostname` for a distinct transfer address. Optional fields in the top-level `pd` section are `provider` (default `mooncake`), `policy` (currently `round_robin`), `capacity` (256 per node), `handoff_timeout` (300 seconds), `request_timeout` (3600 seconds), and `run_id`. Timeouts do not authorize reuse of possibly active memory.
+
+### Launch P/D with MPI Direct
+
+Set `pd.provider` to `hixl` and add `mpi_pd` to the same deployment JSON. Use
+matching Serving installations on the Router and model hosts. Install a
+Simpler build with `simpler.mpi_direct_supervisor --service-config` and an
+MPI implementation with matching `mpi4py` for the supervisor and rank
+Python environments. Configure the chosen MPI launcher to reach and start
+processes on the participating hosts. Run the Router on `controller_host`
+and use one consistent IPv4 address or hostname for each machine. Use
+`127.0.0.1` for a single-host deployment.
+
+For example, keep P and D in `replicas` and add a launch entry for each ID:
+
+```json
+{
+  "replicas": [
+    {"name": "p1", "role": "prefill", "host": "10.0.0.11", "port": 8101},
+    {"name": "d1", "role": "decode", "host": "10.0.0.12", "port": 8102, "control_port": 18102}
+  ],
+  "pd": {"provider": "hixl"},
+  "mpi_pd": {
+    "controller_host": "10.0.0.11",
+    "router_port": 18100,
+    "services": {
+      "p1": {
+        "devices": [0, 1, 2, 3, 4, 5, 6, 7],
+        "argv": ["pypto-serving", "--model", "/models/dsv4", "--served-model-name", "dsv4",
+                 "--backend", "npu", "--platform", "a2a3", "--dp", "8", "--ep", "8", "--tp", "1",
+                 "--lm-head-tp", "4", "--block-size", "32",
+                 "--speculative-config", "{\"method\":\"dspark\",\"num_speculative_tokens\":7}"]
+      },
+      "d1": {
+        "devices": [0, 1, 2, 3, 4, 5, 6, 7],
+        "argv": ["pypto-serving", "--model", "/models/dsv4", "--served-model-name", "dsv4",
+                 "--backend", "npu", "--platform", "a2a3", "--dp", "8", "--ep", "8", "--tp", "1",
+                 "--lm-head-tp", "4", "--block-size", "32",
+                 "--speculative-config", "{\"method\":\"dspark\",\"num_speculative_tokens\":7}"]
+      }
+    }
+  }
+}
+```
+
+Adjust model and device settings for your hosts. Each `argv` is executed as
+an argument array. The Router appends `--host`, `--port`, `--devices`,
+`--pd-role`, `--pd-node-id`, and `--pd-config` from the deployment. An entry
+can also set `cwd` and a string-to-string `env` map. Use `env` for the HIXL
+bridge and per-device settings described below. The Router sends the same
+PD endpoint and runtime settings to each child via Simpler's startup
+environment. The deployment JSON only needs to be on the Router host.
+
+```bash
+pypto-serving-router --replicas deployment.json --port 8110
+```
+
+- `mpi_pd.router_port` is the local rank-0 control port. It is separate from
+  the Router HTTP `--port`. On Decode, `control_port` selects its local MPI
+  relay socket. The MPI launcher and HIXL still need their own network paths.
+- Optional launch fields are `mpirun`, `launcher_family` (`auto`, `mpich`,
+  or `openmpi`), `launcher_args`, `supervisor_python`, and `rank_python`.
+  Supervisor Python defaults to the Router interpreter, and rank Python
+  defaults to the supervisor interpreter.
+- `auth_timeout_s` defaults to 60 seconds, capped by `startup_timeout_s`
+  (1200 seconds). `session_timeout_s` gives each role group 60 seconds to
+  stop. `shutdown_timeout_s` defaults to twice that value plus 48 seconds.
+  `drain_timeout_s` gives active HTTP requests up to 300 seconds to finish.
+- `/health` lists rank events and descriptor verification under `mpi_pd`.
+  The Router starts accepting generation requests when the first compatible
+  P/D pair verifies. Other instances can continue loading. Simpler's
+  startup deadline still applies to the whole MPI job.
+- On shutdown the Router drains HTTP traffic, then asks rank 0 to stop P
+  before D. The Router waits for exit events, the acknowledgement, and the
+  supervisor. A failed cleanup names the instances whose exits were not
+  confirmed. Find the detailed output under `mpi_pd.log_dir` (default
+  `serving_log/mpi_pd`), in a per-job `supervisor.log`.
+
+### Supervisor-owned MPI deployment
+
+Set `mpi_pd.owner` to `"supervisor"` in the same deployment file. The
+Supervisor owns the MPI job, and the Router subscribes to rank 0 over the
+local control port. Supply a shared Router control token in the
+`SIMPLER_MPI_DIRECT_ROUTER_TOKEN` environment variable on the controller host.
+
+```bash
+pypto-serving-router --supervise-mpi --replicas deployment.json --host 0.0.0.0 --port 8110
+```
+
+This starts the Supervisor and Router as separate processes. The Router
+remains available with no usable pairs after a Supervisor-only shutdown.
+To run or restart the
+Router independently on the controller host, use the same token and
+deployment file and omit `--supervise-mpi`. Closing a Router subscriber
+withdraws its routes locally. A replacement Router authenticates and
+receives the current rank-0 snapshot. The original `owner: "router"` mode
+is the default for existing MPI configurations.
+
+You can set `mpi_pd.prebuild` to entries such as
+`{"prefill":"p1","decode":"d2","device_pairs":[[0,0]]}`. Indices are the
+instance-local ranks, in source/destination order. An entry without
+`device_pairs` requests domain binding only. With explicit ranks, rank 0
+first waits for Decode to prepare the receivers. It then asks Prefill to
+bind the domain and connect the selected device pairs. Each command has a
+separate execution deadline set by `mpi_pd.prepare_timeout_s`.
+
+The `mpi_pd` section of `/health` reports each pair as `on_demand`,
+`preparing`, `prebuilt`, `failed`, or `retired`. It reports domain binding
+and device connection separately. The Router matches HTTP descriptors
+against the published identities and selects an `on_demand` or
+`prebuilt` pair. Each request still requires its own Decode reservation,
+write authorization and completion confirmation.
+
+Send SIGINT or SIGTERM to the deployment command to stop the job. Rank 0
+withdraws routes and waits up to `mpi_pd.drain_timeout_s` for the Router
+to confirm that in-flight requests, including SSE, have finished. It
+then stops Prefill before Decode and reports child exit status. A failed
+drain or unconfirmed retirement produces a nonzero result from the
+Supervisor. Serving's request-level safeguards continue to retain pages
+when a write cannot be confirmed.
 
 ### Experimental HIXL CS provider on A3
 

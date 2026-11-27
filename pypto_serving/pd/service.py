@@ -9,6 +9,7 @@
 """The single P-push handoff path. Cache ownership remains in Serving."""
 
 import asyncio
+import base64
 from collections import OrderedDict
 from contextlib import aclosing, suppress
 from dataclasses import dataclass, field, replace
@@ -71,7 +72,7 @@ class Request:
 
 
 class Service:
-    def __init__(self, config, endpoint, role, adapter, core, progress):
+    def __init__(self, config, endpoint, role, adapter, core, progress, *, mpi_control=None):
         self.config, self.endpoint, self.role = config, endpoint, role
         self.adapter, self.core, self.progress = adapter, core, progress
         self.cache = core.kv_cache_manager
@@ -91,6 +92,7 @@ class Service:
         self.hixl_senders = {}
         self.hixl_retired = set()
         self.hixl_open = {}
+        self.mpi_control = mpi_control
 
     async def worker(self, operation, value=None):
         hixl_setup = operation in HIXL_SETUP_OPERATIONS and self.config.provider == "hixl"
@@ -135,17 +137,30 @@ class Service:
         topology = decode(self.registry["topology"], Topology)
         self.node = Node(self.endpoint.node_id, self.role, boot, contract, digest(self.registry),
                          topology, self.config.provider, self.cache.enable_prefix_cache)
-        if self.role == "decode":
-            self.listener = await asyncio.start_server(self._accept, "0.0.0.0", self.endpoint.control_port)
-        elif self.config.provider == "hixl":
-            from simpler.worker import Worker
-            self.hixl_control = Worker(level=4)
-            self.hixl_control.init()
+        try:
+            if self.role == "decode":
+                address = (self.mpi_control.bind_address if self.mpi_control is not None
+                           else ("0.0.0.0", self.endpoint.control_port))
+                self.listener = await asyncio.start_server(self._accept, *address)
+            elif self.config.provider == "hixl":
+                from simpler.worker import Worker
+                self.hixl_control = Worker(level=4)
+                self.hixl_control.init()
+            if self.mpi_control is not None:
+                await self.mpi_control.start(self.node, self.registry, self.prepare_pair)
+        except BaseException:
+            if self.listener is not None:
+                self.listener.close()
+                await self.listener.wait_closed()
+            if self.hixl_control is not None:
+                self.hixl_control.close()
+            raise
         logger.info("ready node=%s role=%s boot=%s prefix=%s", self.node.node_id, self.role,
                     boot, self.node.prefix)
 
     def is_ready(self):
         return (self.node is not None and not self.gated and not self.closing
+                and (self.mpi_control is None or self.mpi_control.ready)
                 and self.core.is_ready())
 
     def status(self, request):
@@ -282,7 +297,9 @@ class Service:
 
     async def _connect_peer(self, node):
         endpoint = self.config.endpoint("decode", node.node_id)
-        reader, writer = await asyncio.open_connection(endpoint.host, endpoint.control_port)
+        address = (self.mpi_control.connect_address(node.node_id) if self.mpi_control is not None
+                   else (endpoint.host, endpoint.control_port))
+        reader, writer = await asyncio.open_connection(*address)
         try:
             await send(writer, dict(node=self.node, registry=self.registry))
             hello = await receive(reader)
@@ -414,6 +431,53 @@ class Service:
             connect=lambda peer, pairs: self.worker("connect_ranks", dict(peer=peer, rank_pairs=pairs)),
             release=lambda: self.retire_hixl_session(peer, session),
         )
+
+    def _check_pair_registration(self, value, role):
+        from simpler.transfer_domain import TransferRegion
+
+        node = decode(value["descriptor"], Node)
+        registry = msgspec.msgpack.decode(base64.b64decode(value["registry"], validate=True))
+        self.config.endpoint(role, node.node_id)
+        if (node.role != role or node.provider != "hixl" or digest(registry) != node.registry
+                or decode(registry["topology"], Topology) != node.topology):
+            raise ValueError("prebuild descriptor or registry differs from the registered generation")
+        regions = tuple(decode(region, TransferRegion) for region in registry["regions"])
+        if ({region.boot for region in regions} != {node.boot}
+                or {region.rank for region in regions} != set(range(node.topology.ranks))
+                or len({(region.rank, region.name) for region in regions}) != len(regions)):
+            raise ValueError("invalid region owner, rank or duplicate entry in prebuild registry")
+        return node
+
+    async def prepare_pair(self, command, result):
+        """Prepare reusable resources while leaving every write behind request authorization."""
+        if not self.is_ready():
+            raise NodeUnavailable("PD node is unavailable for prebuild")
+        p = self._check_pair_registration(command["prefill"], "prefill")
+        d = self._check_pair_registration(command["decode"], "decode")
+        if not p.compatible(d) or self.node != (p if self.role == "prefill" else d):
+            raise ValueError("prebuild pair does not match the current Serving generation")
+        pairs = tuple(tuple(pair) for pair in command["device_pairs"])
+        for source, destination in pairs:
+            p.topology.partition(source)
+            d.topology.partition(destination)
+        if self.role == "decode":
+            if pairs:
+                await self.worker("prepare_link", sorted({destination for _, destination in pairs}))
+                result["receiver_ready"] = True
+            return
+        if pairs and command["receiver_ready"] is not True:
+            raise ValueError("prebuild device connection requires confirmed Decode preparation")
+        async with self.peers.use(d.key, lambda: self.connect(d)) as session:
+            result["domain_bound"] = True
+            if pairs:
+                async def prepared(_):
+                    if not self.is_ready():
+                        raise NodeUnavailable("PD node became unavailable during prebuild")
+
+                await session.transfer_domain.ensure_connected(pairs, prepare_destination=prepared)
+                result["device_connected"] = True
+        record(logger, "hixl.prebuild", prefill=p.node_id, decode=d.node_id,
+               domain_bound=result["domain_bound"], device_connected=result.get("device_connected"))
 
     @staticmethod
     def transfer_copies(domain, plan):
@@ -972,6 +1036,9 @@ class Service:
 
     async def close(self):
         self.closing = True
+        if self.mpi_control is not None and self.mpi_control.settings.coordinated:
+            await self.mpi_control.cancel_preparations()
+            await self.peers.wait_pending(self.config.handoff_timeout)
         if self.cache.tiering is not None:
             self.cache.tiering.wake()
         if self.requests or self.pins.active or self.gated:

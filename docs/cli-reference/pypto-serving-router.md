@@ -14,7 +14,14 @@ pypto-serving-router --replicas replicas.json --port 8000
 
 ## Replica File
 
-A JSON file with `replicas` (endpoints that already exist) and/or `hosts` (machines the router may launch on). At least one of the two must be present.
+A JSON file with `replicas` (HTTP endpoints) and/or `hosts` (machines the router may launch ordinary replicas on). At least one of the two must be present. For a P/D deployment, `mpi_pd` configures the MPI job that starts its role-tagged `replicas`. See [Launch P/D with MPI Direct](../user-guide/pd-disaggregation.md#launch-pd-with-mpi-direct).
+
+### `--supervise-mpi`
+
+Start the Supervisor and an independent Router for an `mpi_pd.owner: "supervisor"`
+deployment. With the same configuration, invoke the Router without this flag to
+subscribe to an existing job. Use the same `SIMPLER_MPI_DIRECT_ROUTER_TOKEN`
+on the controller host. See [Supervisor-owned MPI deployment](../user-guide/pd-disaggregation.md#supervisor-owned-mpi-deployment).
 
 ```json
 {
